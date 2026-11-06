@@ -1,1 +1,442 @@
 
+name: Build Piece S APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Generate Piece S Android Project
+        run: |
+          mkdir -p app/src/main/java/com/pieces/app
+          mkdir -p app/src/main/res/xml
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PieceS"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.pieces.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.pieces.app"
+                  minSdk 24
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          dependencies {
+              implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/device_admin.xml
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies>
+                  <force-lock />
+              </uses-policies>
+          </device-admin>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service.xml
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="50" />
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+              <application
+                  android:label="PieceS"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".DohVpnService"
+                      android:permission="android.permission.BIND_VPN_SERVICE"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".LockAccessibilityService"
+                      android:label="PieceS Protection"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service" />
+                  </service>
+
+                  <receiver
+                      android:name=".LockAdminReceiver"
+                      android:label="PieceS Admin"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN"
+                      android:exported="true">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pieces/app/PieceS.kt
+          package com.pieces.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.app.*
+          import android.app.admin.DeviceAdminReceiver
+          import android.app.admin.DevicePolicyManager
+          import android.content.*
+          import android.net.VpnService
+          import android.os.*
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.*
+          import okhttp3.*
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.InetAddress
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(50, 50, 50, 50)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Piece S: NextDNS + Fortress Lock"
+                      textSize = 20f
+                  }
+                  layout.addView(title)
+
+                  val dnsInput = EditText(this).apply {
+                      hint = "Enter NextDNS ID (e.g. a1b2c3)"
+                      setText(prefs.getString("dns_id", ""))
+                      isEnabled = !prefs.getBoolean("locked", false)
+                  }
+                  layout.addView(dnsInput)
+
+                  val btnVpn = Button(this).apply {
+                      text = "1. Start NextDNS DoH VPN"
+                      setOnClickListener {
+                          val raw = dnsInput.text.toString().trim()
+                              .replace("https://dns.nextdns.io/", "")
+                              .replace("/", "")
+                          if (raw.isEmpty()) {
+                              Toast.makeText(this@MainActivity, "Enter your NextDNS ID first!", Toast.LENGTH_SHORT).show()
+                              return@setOnClickListener
+                          }
+                          prefs.edit().putString("dns_id", raw).apply()
+                          val intent = VpnService.prepare(this@MainActivity)
+                          if (intent != null) startActivityForResult(intent, 100)
+                          else onActivityResult(100, RESULT_OK, null)
+                      }
+                  }
+                  layout.addView(btnVpn)
+
+                  val btnAdmin = Button(this).apply {
+                      text = "2. Enable Anti-Uninstall (Device Admin)"
+                      setOnClickListener {
+                          val comp = ComponentName(this@MainActivity, LockAdminReceiver::class.java)
+                          val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                              putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp)
+                              putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Prevents uninstalling PieceS.")
+                          }
+                          startActivity(intent)
+                      }
+                  }
+                  layout.addView(btnAdmin)
+
+                  val btnAcc = Button(this).apply {
+                      text = "3. Enable Settings Blocker (Accessibility)"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+                  layout.addView(btnAcc)
+
+                  val pinInput = EditText(this).apply {
+                      hint = "Enter PIN to Lock/Unlock (Default: 1234)"
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                  }
+                  layout.addView(pinInput)
+
+                  val statusText = TextView(this).apply {
+                      textSize = 16f
+                      setPadding(0, 20, 0, 20)
+                  }
+
+                  fun updateStatus() {
+                      val locked = prefs.getBoolean("locked", false)
+                      statusText.text = if (locked) "STATUS: LOCKED (Settings & Uninstall Blocked)" else "STATUS: UNLOCKED (Testing Mode)"
+                      dnsInput.isEnabled = !locked
+                  }
+                  updateStatus()
+
+                  val btnLock = Button(this).apply {
+                      text = "4. Toggle Fortress Lock (Requires PIN)"
+                      setOnClickListener {
+                          val pin = pinInput.text.toString()
+                          if (pin == "1234") {
+                              val newLock = !prefs.getBoolean("locked", false)
+                              prefs.edit().putBoolean("locked", newLock).apply()
+                              pinInput.setText("")
+                              updateStatus()
+                              Toast.makeText(this@MainActivity, if (newLock) "Fortress Locked!" else "Unlocked!", Toast.LENGTH_SHORT).show()
+                          } else {
+                              Toast.makeText(this@MainActivity, "Wrong PIN!", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+                  layout.addView(btnLock)
+                  layout.addView(statusText)
+
+                  setContentView(layout)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (requestCode == 100 && resultCode == RESULT_OK) {
+                      startService(Intent(this, DohVpnService::class.java))
+                      Toast.makeText(this, "NextDNS DoH VPN Running!", Toast.LENGTH_SHORT).show()
+                  }
+              }
+          }
+
+          class DohVpnService : VpnService() {
+              private var vpnInterface: ParcelFileDescriptor? = null
+              private val executor = Executors.newCachedThreadPool()
+
+              private val httpClient = OkHttpClient.Builder()
+                  .dns(object : Dns {
+                      override fun lookup(hostname: String): List<InetAddress> {
+                          return listOf(
+                              InetAddress.getByName("45.90.28.0"),
+                              InetAddress.getByName("45.90.30.0")
+                          )
+                      }
+                  })
+                  .build()
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (vpnInterface != null) return START_STICKY
+                  val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
+                  val dnsId = prefs.getString("dns_id", "") ?: ""
+
+                  val channelId = "pieces_vpn"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val chan = NotificationChannel(channelId, "PieceS VPN", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+                      val notif = Notification.Builder(this, channelId)
+                          .setContentTitle("PieceS NextDNS Active")
+                          .setContentText("Protected by DoH Lock")
+                          .setSmallIcon(android.R.drawable.ic_lock_lock)
+                          .build()
+                      startForeground(1, notif)
+                  }
+
+                  val builder = Builder()
+                      .setSession("PieceS")
+                      .addAddress("10.111.222.1", 24)
+                      .addDnsServer("10.111.222.2")
+                      .addRoute("10.111.222.2", 32)
+                      .addDisallowedApplication(packageName)
+                      .setMtu(1500)
+
+                  vpnInterface = builder.establish()
+                  val fd = vpnInterface?.fileDescriptor ?: return START_STICKY
+
+                  Thread {
+                      val input = FileInputStream(fd)
+                      val output = FileOutputStream(fd)
+                      val buffer = ByteArray(32767)
+                      while (vpnInterface != null) {
+                          val len = try { input.read(buffer) } catch (e: Exception) { break }
+                          if (len > 28) {
+                              val packet = buffer.copyOf(len)
+                              executor.execute { handlePacket(packet, output, dnsId) }
+                          }
+                      }
+                  }.start()
+
+                  return START_STICKY
+              }
+
+              private fun handlePacket(req: ByteArray, output: FileOutputStream, dnsId: String) {
+                  try {
+                      if ((req[0].toInt() and 0xF0) != 0x40 || req[9].toInt() != 17) return
+                      val ihl = (req[0].toInt() and 0x0F) * 4
+                      val dnsOffset = ihl + 8
+                      if (req.size <= dnsOffset) return
+                      val dnsPayload = req.copyOfRange(dnsOffset, req.size)
+
+                      val body = dnsPayload.toRequestBody("application/dns-message".toMediaType())
+                      val httpReq = Request.Builder()
+                          .url("https://dns.nextdns.io/$dnsId")
+                          .post(body)
+                          .header("Accept", "application/dns-message")
+                          .build()
+
+                      val dnsResp = httpClient.newCall(httpReq).execute().use { resp ->
+                          if (!resp.isSuccessful) return
+                          resp.body?.bytes() ?: return
+                      }
+
+                      val respLen = ihl + 8 + dnsResp.size
+                      val out = ByteArray(respLen)
+                      System.arraycopy(req, 0, out, 0, ihl)
+                      out[2] = ((respLen ushr 8) and 0xFF).toByte()
+                      out[3] = (respLen and 0xFF).toByte()
+                      System.arraycopy(req, 12, out, 16, 4)
+                      System.arraycopy(req, 16, out, 12, 4)
+                      out[10] = 0
+                      out[11] = 0
+
+                      var sum = 0
+                      for (i in 0 until ihl step 2) {
+                          val word = ((out[i].toInt() and 0xFF) shl 8) or (out[i + 1].toInt() and 0xFF)
+                          sum += word
+                      }
+                      while ((sum ushr 16) != 0) sum = (sum and 0xFFFF) + (sum ushr 16)
+                      val csum = sum.inv() and 0xFFFF
+                      out[10] = ((csum ushr 8) and 0xFF).toByte()
+                      out[11] = (csum and 0xFF).toByte()
+
+                      out[ihl] = req[ihl + 2]
+                      out[ihl + 1] = req[ihl + 3]
+                      out[ihl + 2] = req[ihl]
+                      out[ihl + 3] = req[ihl + 1]
+                      val udpLen = 8 + dnsResp.size
+                      out[ihl + 4] = ((udpLen ushr 8) and 0xFF).toByte()
+                      out[ihl + 5] = (udpLen and 0xFF).toByte()
+                      out[ihl + 6] = 0
+                      out[ihl + 7] = 0
+
+                      System.arraycopy(dnsResp, 0, out, ihl + 8, dnsResp.size)
+                      synchronized(output) { output.write(out) }
+                  } catch (_: Exception) {}
+              }
+          }
+
+          class LockAccessibilityService : AccessibilityService() {
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
+                  if (!prefs.getBoolean("locked", false)) return
+                  val pkg = event?.packageName?.toString() ?: return
+                  if (pkg == packageName) return
+
+                  if (pkg.contains("settings", true) || pkg.contains("packageinstaller", true) || pkg.contains("security", true)) {
+                      val root = rootInActiveWindow ?: return
+                      if (containsText(root, "PieceS")) {
+                          performGlobalAction(GLOBAL_ACTION_HOME)
+                      }
+                  }
+              }
+
+              private fun containsText(node: AccessibilityNodeInfo?, target: String): Boolean {
+                  if (node == null) return false
+                  val text = node.text?.toString() ?: ""
+                  val desc = node.contentDescription?.toString() ?: ""
+                  if (text.contains(target, true) || desc.contains(target, true)) return true
+                  for (i in 0 until node.childCount) {
+                      if (containsText(node.getChild(i), target)) return true
+                  }
+                  return false
+              }
+
+              override fun onInterrupt() {}
+          }
+
+          class LockAdminReceiver : DeviceAdminReceiver()
+          EOF
+
+      - name: Compile APK with Gradle
+        run: gradle assembleDebug
+
+      - name: Upload PieceS APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PieceS-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
