@@ -20,10 +20,11 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Generate Piece S v2.1 Project
+      - name: Generate Piece S v3.0 Project
         run: |
           mkdir -p app/src/main/java/com/pieces/app
           mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
 
           cat << 'EOF' > settings.gradle
           pluginManagement {
@@ -63,8 +64,8 @@ jobs:
                   applicationId "com.pieces.app"
                   minSdk 24
                   targetSdk 33
-                  versionCode 3
-                  versionName "2.1"
+                  versionCode 4
+                  versionName "3.0 [PIECES_APPINFO_GUARD]"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -79,6 +80,14 @@ jobs:
           }
           EOF
 
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <resources>
+              <string name="app_name">PieceS</string>
+              <string name="acc_desc">Smart Protection Active [PIECES_ACC_GUARD]</string>
+              <string name="admin_desc">Uninstall Protection Active [PIECES_ADMIN_GUARD]</string>
+          </resources>
+          EOF
+
           cat << 'EOF' > app/src/main/res/xml/device_admin.xml
           <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-policies>
@@ -89,11 +98,12 @@ jobs:
 
           cat << 'EOF' > app/src/main/res/xml/accessibility_service.xml
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked"
+              android:description="@string/acc_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="15" />
+              android:notificationTimeout="50" />
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
@@ -103,7 +113,7 @@ jobs:
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
               <application
-                  android:label="PieceS"
+                  android:label="@string/app_name"
                   android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
 
                   <activity
@@ -127,6 +137,7 @@ jobs:
                   <service
                       android:name=".LockAccessibilityService"
                       android:label="PieceS Protection"
+                      android:description="@string/acc_desc"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
                       android:exported="true">
                       <intent-filter>
@@ -140,6 +151,7 @@ jobs:
                   <receiver
                       android:name=".LockAdminReceiver"
                       android:label="PieceS Admin"
+                      android:description="@string/admin_desc"
                       android:permission="android.permission.BIND_DEVICE_ADMIN"
                       android:exported="true">
                       <meta-data
@@ -183,9 +195,11 @@ jobs:
           import java.io.FileOutputStream
           import java.net.InetAddress
           import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
 
           class MainActivity : Activity() {
               private lateinit var statusText: TextView
+              private lateinit var testResultText: TextView
               private lateinit var dnsInput: EditText
               private lateinit var btnLock: Button
 
@@ -193,13 +207,15 @@ jobs:
                   super.onCreate(savedInstanceState)
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
 
+                  val scroll = ScrollView(this)
                   val layout = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(50, 40, 50, 40)
                   }
+                  scroll.addView(layout)
 
                   val title = TextView(this).apply {
-                      text = "Piece S v2.1: Smart Surgical Lock"
+                      text = "Piece S v3.0: Precision Edition"
                       textSize = 20f
                   }
                   layout.addView(title)
@@ -211,7 +227,7 @@ jobs:
                   layout.addView(dnsInput)
 
                   val btnVpn = Button(this).apply {
-                      text = "1. Start NextDNS DoH VPN"
+                      text = "1. Start / Restart NextDNS DoH VPN"
                       setOnClickListener {
                           val raw = dnsInput.text.toString().trim()
                               .replace("https://dns.nextdns.io/", "")
@@ -228,13 +244,48 @@ jobs:
                   }
                   layout.addView(btnVpn)
 
+                  val btnTest = Button(this).apply {
+                      text = "🔍 Verify NextDNS Resolver (Live Test)"
+                      setOnClickListener {
+                          val raw = dnsInput.text.toString().trim()
+                              .replace("https://dns.nextdns.io/", "")
+                              .replace("/", "")
+                          if (raw.isEmpty()) {
+                              testResultText.text = "⚠️ Enter NextDNS ID first"
+                              return@setOnClickListener
+                          }
+                          testResultText.text = "Testing DoH tunnel & NextDNS..."
+                          Thread {
+                              val start = System.currentTimeMillis()
+                              val ok = DohVpnService.testDohEndpoint(raw)
+                              val ms = System.currentTimeMillis() - start
+                              runOnUiThread {
+                                  if (ok) {
+                                      testResultText.text = "✅ NextDNS DoH Verified & Filtering! (${ms}ms)"
+                                  } else {
+                                      testResultText.text = "❌ DoH Test Failed. Check internet or ID."
+                                  }
+                                  refreshStatus()
+                              }
+                          }.start()
+                      }
+                  }
+                  layout.addView(btnTest)
+
+                  testResultText = TextView(this).apply {
+                      text = "Tap 'Verify' above to test resolver."
+                      textSize = 14f
+                      setPadding(0, 10, 0, 20)
+                  }
+                  layout.addView(testResultText)
+
                   val btnAdmin = Button(this).apply {
                       text = "2. Enable Anti-Uninstall (Device Admin)"
                       setOnClickListener {
                           val comp = ComponentName(this@MainActivity, LockAdminReceiver::class.java)
                           val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
                               putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp)
-                              putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Prevents uninstalling PieceS.")
+                              putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Prevents uninstalling PieceS [PIECES_ADMIN_GUARD]")
                           }
                           startActivity(intent)
                       }
@@ -242,7 +293,7 @@ jobs:
                   layout.addView(btnAdmin)
 
                   val btnAcc = Button(this).apply {
-                      text = "3. Enable Smart Guard (Accessibility)"
+                      text = "3. Enable Surgical Guard (Accessibility)"
                       setOnClickListener {
                           startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                       }
@@ -250,7 +301,7 @@ jobs:
                   layout.addView(btnAcc)
 
                   val pinInput = EditText(this).apply {
-                      hint = "PIN required ONLY to Unlock (1234)"
+                      hint = "PIN to Unlock (Default: 1234)"
                       inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
                   }
                   layout.addView(pinInput)
@@ -259,15 +310,13 @@ jobs:
                       setOnClickListener {
                           val isLocked = prefs.getBoolean("locked", false)
                           if (!isLocked) {
-                              // 1-Tap Lock (No PIN required to lock!)
                               prefs.edit().putBoolean("locked", true).apply()
                               if (VpnService.prepare(this@MainActivity) == null) {
                                   startService(Intent(this@MainActivity, DohVpnService::class.java))
                               }
                               refreshStatus()
-                              Toast.makeText(this@MainActivity, "🔒 Smart Guard LOCKED!", Toast.LENGTH_SHORT).show()
+                              Toast.makeText(this@MainActivity, "🔒 Protection LOCKED!", Toast.LENGTH_SHORT).show()
                           } else {
-                              // Unlock requires PIN
                               if (pinInput.text.toString() == "1234") {
                                   prefs.edit().putBoolean("locked", false).apply()
                                   pinInput.setText("")
@@ -287,7 +336,7 @@ jobs:
                   }
                   layout.addView(statusText)
 
-                  setContentView(layout)
+                  setContentView(scroll)
               }
 
               override fun onResume() {
@@ -306,27 +355,29 @@ jobs:
                   btnLock.text = if (locked) "4. UNLOCK PROTECTION (Requires PIN)" else "4. ACTIVATE LOCK NOW (1-Tap)"
 
                   statusText.text = buildString {
-                      appendLine("LIVE CHECKLIST:")
-                      appendLine(if (DohVpnService.isRunning) "✅ 1. NextDNS VPN: RUNNING" else "❌ 1. NextDNS VPN: STOPPED")
+                      appendLine("SYSTEM STATUS:")
+                      appendLine(if (DohVpnService.isRunning) "✅ 1. NextDNS DoH VPN: RUNNING (${DohVpnService.queriesCount} queries resolved)" else "❌ 1. NextDNS DoH VPN: STOPPED")
                       appendLine(if (adminActive) "✅ 2. Device Admin: ACTIVE" else "❌ 2. Device Admin: OFF")
-                      appendLine(if (accActive) "✅ 3. Smart Accessibility Guard: ACTIVE" else "❌ 3. Smart Accessibility Guard: OFF")
-                      appendLine(if (locked) "\n🔒 STATUS: LOCKED & PROTECTED" else "\n🔓 STATUS: UNLOCKED (Tap Button 4 to Lock)")
+                      appendLine(if (accActive) "✅ 3. Surgical Accessibility Guard: ACTIVE" else "❌ 3. Surgical Accessibility Guard: OFF")
+                      appendLine(if (locked) "\n🔒 MODE: LOCKED & PROTECTED" else "\n🔓 MODE: UNLOCKED (Testing Mode)")
                   }
               }
 
               private fun isAccessibilityEnabled(): Boolean {
-                  val expected = "$packageName/${LockAccessibilityService::class.java.canonicalName}"
                   val enabledServices = Settings.Secure.getString(
                       contentResolver,
                       Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
                   ) ?: return false
-                  return enabledServices.contains(expected, true) || enabledServices.contains(packageName, true)
+                  return enabledServices.contains(packageName, true)
               }
 
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   if (requestCode == 100 && resultCode == RESULT_OK) {
-                      startService(Intent(this, DohVpnService::class.java))
-                      Handler(Looper.getMainLooper()).postDelayed({ refreshStatus() }, 500)
+                      val intent = Intent(this, DohVpnService::class.java).apply {
+                          putExtra("force_restart", true)
+                      }
+                      startService(intent)
+                      Handler(Looper.getMainLooper()).postDelayed({ refreshStatus() }, 600)
                   }
               }
           }
@@ -334,36 +385,70 @@ jobs:
           class DohVpnService : VpnService() {
               companion object {
                   @Volatile var isRunning = false
+                  @Volatile var queriesCount = 0
+
+                  val httpClient: OkHttpClient = OkHttpClient.Builder()
+                      .connectTimeout(5, TimeUnit.SECONDS)
+                      .readTimeout(5, TimeUnit.SECONDS)
+                      .retryOnConnectionFailure(true)
+                      .dns(object : Dns {
+                          override fun lookup(hostname: String): List<InetAddress> {
+                              return listOf(
+                                  InetAddress.getByName("45.90.28.0"),
+                                  InetAddress.getByName("45.90.30.0")
+                              )
+                          }
+                      })
+                      .build()
+
+                  fun testDohEndpoint(dnsId: String): Boolean {
+                      return try {
+                          // Minimal valid DNS A-record query for example.com
+                          val sampleQuery = byteArrayOf(
+                              0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+                              0x00, 0x00, 0x01, 0x00, 0x01
+                          )
+                          val body = sampleQuery.toRequestBody("application/dns-message".toMediaType())
+                          val req = Request.Builder()
+                              .url("https://dns.nextdns.io/$dnsId")
+                              .post(body)
+                              .header("Accept", "application/dns-message")
+                              .build()
+                          httpClient.newCall(req).execute().use { resp ->
+                              resp.isSuccessful && (resp.body?.bytes()?.size ?: 0) > 12
+                          }
+                      } catch (_: Exception) {
+                          false
+                      }
+                  }
               }
 
               private var vpnInterface: ParcelFileDescriptor? = null
+              private var readerThread: Thread? = null
               private val executor = Executors.newCachedThreadPool()
 
-              private val httpClient = OkHttpClient.Builder()
-                  .dns(object : Dns {
-                      override fun lookup(hostname: String): List<InetAddress> {
-                          return listOf(
-                              InetAddress.getByName("45.90.28.0"),
-                              InetAddress.getByName("45.90.30.0")
-                          )
-                      }
-                  })
-                  .build()
-
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  if (vpnInterface != null) return START_STICKY
+                  val forceRestart = intent?.getBooleanExtra("force_restart", false) ?: false
+                  if (isRunning && vpnInterface != null && !forceRestart) {
+                      return START_STICKY
+                  }
+
+                  stopCurrentTunnel()
+
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
                   val dnsId = prefs.getString("dns_id", "") ?: ""
                   if (dnsId.isEmpty()) return START_NOT_STICKY
 
-                  val channelId = "pieces_vpn"
+                  val channelId = "nextdns_shield_channel"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val chan = NotificationChannel(channelId, "NextDNS Shield", NotificationManager.IMPORTANCE_LOW)
+                      val chan = NotificationChannel(channelId, "DNS Shield", NotificationManager.IMPORTANCE_LOW)
                       getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+                      // IMPORTANT: Do NOT put the word "PieceS" in the notification text so pulling down the notification slider never triggers text matching
                       val notif = Notification.Builder(this, channelId)
-                          .setContentTitle("PieceS NextDNS Active")
-                          .setContentText("DoH Protection Running")
-                          .setSmallIcon(android.R.drawable.ic_lock_lock)
+                          .setContentTitle("NextDNS Shield Active")
+                          .setContentText("Encrypted DoH Resolver Running")
+                          .setSmallIcon(android.R.drawable.ic_secure)
                           .build()
                       startForeground(1, notif)
                   }
@@ -376,32 +461,52 @@ jobs:
                       .addDisallowedApplication(packageName)
                       .setMtu(1500)
 
-                  vpnInterface = builder.establish()
-                  val fd = vpnInterface?.fileDescriptor ?: return START_STICKY
+                  val pfd = builder.establish() ?: return START_STICKY
+                  vpnInterface = pfd
                   isRunning = true
 
-                  Thread {
+                  readerThread = Thread {
+                      val fd = pfd.fileDescriptor
                       val input = FileInputStream(fd)
                       val output = FileOutputStream(fd)
                       val buffer = ByteArray(32767)
-                      while (vpnInterface != null) {
-                          val len = try { input.read(buffer) } catch (e: Exception) { break }
-                          if (len <= 0) break
-                          if (len > 28) {
-                              val packet = buffer.copyOf(len)
-                              executor.execute { handlePacket(packet, output, dnsId) }
+                      try {
+                          while (isRunning && vpnInterface != null) {
+                              val len = try {
+                                  input.read(buffer)
+                              } catch (_: Exception) {
+                                  break
+                              }
+                              if (len > 28) {
+                                  val packet = buffer.copyOf(len)
+                                  executor.execute { handlePacket(packet, output, dnsId) }
+                              } else if (len == 0) {
+                                  Thread.sleep(5)
+                              }
+                          }
+                      } catch (_: Exception) {
+                      } finally {
+                          isRunning = false
+                          try { pfd.close() } catch (_: Exception) {}
+                          if (vpnInterface === pfd) {
+                              vpnInterface = null
                           }
                       }
-                      isRunning = false
-                  }.start()
+                  }.also { it.start() }
 
                   return START_STICKY
               }
 
-              override fun onRevoke() {
+              private fun stopCurrentTunnel() {
+                  isRunning = false
                   try { vpnInterface?.close() } catch (_: Exception) {}
                   vpnInterface = null
-                  isRunning = false
+                  readerThread?.interrupt()
+                  readerThread = null
+              }
+
+              override fun onRevoke() {
+                  stopCurrentTunnel()
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
                   if (prefs.getBoolean("locked", false)) {
                       startService(Intent(this, DohVpnService::class.java))
@@ -410,9 +515,7 @@ jobs:
               }
 
               override fun onDestroy() {
-                  try { vpnInterface?.close() } catch (_: Exception) {}
-                  vpnInterface = null
-                  isRunning = false
+                  stopCurrentTunnel()
                   super.onDestroy()
               }
 
@@ -468,13 +571,14 @@ jobs:
 
                       System.arraycopy(dnsResp, 0, out, ihl + 8, dnsResp.size)
                       synchronized(output) { output.write(out) }
+                      queriesCount++
                   } catch (_: Exception) {}
               }
           }
 
           class LockAccessibilityService : AccessibilityService() {
               private val handler = Handler(Looper.getMainLooper())
-              private var lastToastTime = 0L
+              private var lastBlockTime = 0L
 
               private val watchdog = object : Runnable {
                   override fun run() {
@@ -484,7 +588,7 @@ jobs:
                               startService(Intent(this@LockAccessibilityService, DohVpnService::class.java))
                           }
                       }
-                      handler.postDelayed(this, 1000)
+                      handler.postDelayed(this, 1500)
                   }
               }
 
@@ -497,69 +601,87 @@ jobs:
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
                   if (!prefs.getBoolean("locked", false)) return
 
-                  val pkg = event?.packageName?.toString() ?: ""
-                  // Never block our own app or the home launcher
-                  if (pkg == packageName || pkg.contains("launcher", true)) return
+                  val root = rootInActiveWindow ?: return
+                  val activePkg = root.packageName?.toString() ?: ""
 
-                  // 1. Direct System VPN Disconnect Dialog (from Notification bar or Quick Settings)
-                  if (pkg.contains("vpndialogs", true)) {
-                      surgicalBlock()
+                  // 1. STRICT WHITELIST: Never touch our own app, the Upper Notification Slider (systemui), or Home Launchers
+                  if (activePkg == packageName ||
+                      activePkg.contains("systemui", true) ||
+                      activePkg.contains("launcher", true) ||
+                      activePkg.contains("home", true)) {
                       return
                   }
 
-                  // 2. If user directly taps/clicks on "PieceS" inside any Settings/VPN/Accessibility list
-                  if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
-                      val clickedText = event.text?.joinToString(" ") ?: ""
-                      val contentDesc = event.contentDescription?.toString() ?: ""
-                      if (clickedText.contains("PieceS", true) || contentDesc.contains("PieceS", true)) {
-                          surgicalBlock()
-                          return
+                  // 2. Direct System VPN Disconnect Dialog (com.android.vpndialogs)
+                  if (activePkg.contains("vpndialogs", true)) {
+                      val sb = StringBuilder()
+                      collectText(root, sb)
+                      if (sb.toString().contains("PieceS", true)) {
+                          surgicalBack()
                       }
+                      return
                   }
 
-                  // 3. Check if current open sub-page or pop-up dialog is specifically targeting PieceS
-                  val root = rootInActiveWindow ?: return
-                  val allText = StringBuilder()
-                  collectText(root, allText)
-                  val screenText = allText.toString()
+                  // 3. Only inspect Settings / Security / PackageInstaller windows
+                  val isSettingsApp = activePkg.contains("settings", true) ||
+                      activePkg.contains("packageinstaller", true) ||
+                      activePkg.contains("security", true) ||
+                      activePkg.contains("miui", true)
 
-                  if (screenText.contains("PieceS", true)) {
-                      val className = event?.className?.toString() ?: ""
-                      val isDialog = className.contains("Dialog", true) || className.contains("Alert", true)
+                  if (!isSettingsApp) return
 
-                      // Check if this is the PieceS sub-page (Accessibility toggle, VPN config, App Info, or Admin)
-                      val isPieceSSubPage = isDialog ||
-                          screenText.contains("PieceS Protection", true) && (
-                              screenText.contains("Use ", true) ||
-                              screenText.contains("Stop", true) ||
-                              screenText.contains("Turn off", true) ||
-                              screenText.contains("Shortcut", true) ||
-                              screenText.contains("Désactiver", true) ||
-                              screenText.contains("Arrêter", true)
-                          ) ||
-                          screenText.contains("Disconnect", true) ||
-                          screenText.contains("Déconnecter", true) ||
-                          screenText.contains("Forget", true) ||
-                          screenText.contains("Always-on", true) ||
-                          screenText.contains("Force stop", true) ||
-                          screenText.contains("Forcer l'arrêt", true) ||
-                          screenText.contains("Deactivate", true) ||
-                          screenText.contains("Uninstall", true)
+                  val sb = StringBuilder()
+                  collectText(root, sb)
+                  val screen = sb.toString()
 
-                      if (isPieceSSubPage) {
-                          surgicalBlock()
-                      }
+                  // TARGET A: Accessibility Toggle Sub-Page for PieceS (or its Turn-Off Confirmation Dialog)
+                  // [PIECES_ACC_GUARD] is ONLY rendered by Android inside the PieceS Accessibility detail page, NEVER on the Accessibility list!
+                  if (screen.contains("[PIECES_ACC_GUARD]")) {
+                      surgicalBack()
+                      return
+                  }
+                  if (screen.contains("PieceS Protection") &&
+                      (screen.contains("Stop PieceS", true) ||
+                       screen.contains("Turn off PieceS", true) ||
+                       screen.contains("Désactiver PieceS", true) ||
+                       screen.contains("Arrêter PieceS", true))) {
+                      surgicalBack()
+                      return
+                  }
+
+                  // TARGET B: Device Admin Deactivation Sub-Page for PieceS
+                  // [PIECES_ADMIN_GUARD] is ONLY rendered inside the PieceS Device Admin detail screen, NEVER on the Device Admin list!
+                  if (screen.contains("[PIECES_ADMIN_GUARD]")) {
+                      surgicalBack()
+                      return
+                  }
+
+                  // TARGET C: App Info Sub-Page for PieceS (Force Stop / Uninstall)
+                  // [PIECES_APPINFO_GUARD] is part of versionName, which Android ONLY shows inside PieceS's App Info screen!
+                  if (screen.contains("[PIECES_APPINFO_GUARD]")) {
+                      surgicalBack()
+                      return
+                  }
+
+                  // TARGET D: VPN Settings Disconnect Dialog / Sub-Page for PieceS
+                  if (screen.contains("PieceS") &&
+                      (screen.contains("Disconnect", true) ||
+                       screen.contains("Déconnecter", true) ||
+                       screen.contains("Forget VPN", true) ||
+                       screen.contains("Delete VPN", true) ||
+                       screen.contains("Always-on VPN", true))) {
+                      surgicalBack()
+                      return
                   }
               }
 
-              private fun surgicalBlock() {
-                  performGlobalAction(GLOBAL_ACTION_BACK)
+              private fun surgicalBack() {
                   val now = System.currentTimeMillis()
-                  if (now - lastToastTime > 1500) {
-                      lastToastTime = now
-                      handler.post {
-                          Toast.makeText(applicationContext, "🔒 Protected by PieceS! Unlock in app first.", Toast.LENGTH_SHORT).show()
-                      }
+                  if (now - lastBlockTime < 300) return
+                  lastBlockTime = now
+                  performGlobalAction(GLOBAL_ACTION_BACK)
+                  handler.post {
+                      Toast.makeText(applicationContext, "🔒 Protected by PieceS", Toast.LENGTH_SHORT).show()
                   }
               }
 
@@ -593,5 +715,5 @@ jobs:
       - name: Upload PieceS APK
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-v2.1-APK
+          name: PieceS-v3.0-APK
           path: app/build/outputs/apk/debug/app-debug.apk
