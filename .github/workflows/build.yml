@@ -20,7 +20,7 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Generate Piece S v3.4 Project
+      - name: Generate Piece S v3.5 Final Project
         run: |
           mkdir -p app/src/main/java/com/pieces/app
           mkdir -p app/src/main/res/xml
@@ -62,8 +62,8 @@ jobs:
                   applicationId "com.pieces.app"
                   minSdk 24
                   targetSdk 33
-                  versionCode 8
-                  versionName "3.4 [PIECES_APPINFO_GUARD]"
+                  versionCode 9
+                  versionName "3.5 [PIECES_APPINFO_GUARD]"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -101,7 +101,7 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="50" />
+              android:notificationTimeout="0" />
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
@@ -220,7 +220,7 @@ jobs:
                   scroll.addView(layout)
 
                   val title = TextView(this).apply {
-                      text = "Piece S v3.4: Fortress Edition"
+                      text = "Piece S v3.5: Final Edition"
                       textSize = 20f
                   }
                   layout.addView(title)
@@ -387,7 +387,6 @@ jobs:
               }
           }
 
-          // Invisible 0ms helper that automatically reclaims VPN permission if stolen by a pre-authorized VPN
           class AutoReconnectActivity : Activity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -497,11 +496,19 @@ jobs:
                       startForeground(1, notif)
                   }
 
+                  // Routes 10.111.222.2 AND public DNS IPs (Google, Cloudflare, Quad9) into the tunnel:
+                  // - Any TCP Port 853 (Private DNS / DoT) packet to dns.google or 1.1.1.1 is blackholed!
+                  // - Any hardcoded UDP Port 53 packet to 8.8.8.8 or 1.1.1.1 is forced through NextDNS!
                   val builder = Builder()
                       .setSession("PieceS")
                       .addAddress("10.111.222.1", 24)
                       .addDnsServer("10.111.222.2")
                       .addRoute("10.111.222.2", 32)
+                      .addRoute("8.8.8.8", 32)
+                      .addRoute("8.8.4.4", 32)
+                      .addRoute("1.1.1.1", 32)
+                      .addRoute("1.0.0.1", 32)
+                      .addRoute("9.9.9.9", 32)
                       .addDisallowedApplication(packageName)
                       .setMtu(1500)
 
@@ -562,10 +569,16 @@ jobs:
 
               private fun handlePacket(req: ByteArray, output: FileOutputStream, dnsId: String) {
                   try {
+                      // Drop non-IPv4 or non-UDP packets (this automatically blackholes TCP Port 853 Private DNS!)
                       if ((req[0].toInt() and 0xF0) != 0x40 || req[9].toInt() != 17) return
                       val ihl = (req[0].toInt() and 0x0F) * 4
                       val dnsOffset = ihl + 8
                       if (req.size <= dnsOffset) return
+
+                      // Only allow UDP Port 53 (standard DNS); drop UDP Port 443 QUIC to 8.8.8.8/1.1.1.1
+                      val dstPort = ((req[ihl + 2].toInt() and 0xFF) shl 8) or (req[ihl + 3].toInt() and 0xFF)
+                      if (dstPort != 53) return
+
                       val dnsPayload = req.copyOfRange(dnsOffset, req.size)
 
                       val body = dnsPayload.toRequestBody("application/dns-message".toMediaType())
@@ -619,7 +632,7 @@ jobs:
 
           class LockAccessibilityService : AccessibilityService() {
               private val handler = Handler(Looper.getMainLooper())
-              private var lastBlockTime = 0L
+              private var lastToastTime = 0L
 
               private val watchdog = object : Runnable {
                   override fun run() {
@@ -649,9 +662,6 @@ jobs:
                   }
 
                   // 2. LOOPHOLE 3: System VPN Dialogs (com.android.vpndialogs)
-                  //    - Blocks disconnecting PieceS
-                  //    - Blocks ANY other VPN app from getting permission to connect
-                  //    - Automatically clicks "OK" if PieceS is reclaiming a stolen VPN tunnel
                   if (activePkg.contains("vpndialogs", true)) {
                       val sb = StringBuilder()
                       val ids = StringBuilder()
@@ -723,10 +733,11 @@ jobs:
                   // 5. Inside Settings / Security / PackageInstaller
                   val clsName = event?.className?.toString() ?: ""
 
+                  // Instant Click Intercept on "PieceS Admin" OR "Private DNS" before the sub-page even finishes opening!
                   if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
                       val clickedText = (event.text?.joinToString(" ") ?: "") + " " + (event.contentDescription?.toString() ?: "")
-                      if (clickedText.contains("PieceS Admin", true)) {
-                          surgicalBack()
+                      if (clickedText.contains("PieceS Admin", true) || clickedText.contains("Private DNS", true)) {
+                          surgicalBack(multiPulse = true)
                           return
                       }
                   }
@@ -741,7 +752,7 @@ jobs:
                       clsName.contains("AppLocalePicker", true) ||
                       clsName.contains("LanguageSettings", true) ||
                       clsName.contains("PrivateDns", true)) {
-                      surgicalBack()
+                      surgicalBack(multiPulse = true)
                       return
                   }
 
@@ -831,7 +842,7 @@ jobs:
                       return
                   }
 
-                  // TARGET G: PRIVATE DNS SUB-PAGE / DIALOG BLOCK (Matches your exact screenshot + stock Android)
+                  // TARGET G: PRIVATE DNS SUB-PAGE / DIALOG BLOCK (Auto-clicks "Off" + Instant Back)
                   val isInsidePrivateDns =
                       viewIds.contains("private_dns_mode", true) ||
                       viewIds.contains("private_dns_help", true) ||
@@ -842,8 +853,29 @@ jobs:
                       screen.contains("Select Private DNS mode", true)
 
                   if (isInsidePrivateDns) {
-                      surgicalBack()
+                      forceClickOffOption(root)
+                      surgicalBack(multiPulse = true)
                       return
+                  }
+              }
+
+              private fun forceClickOffOption(node: AccessibilityNodeInfo?) {
+                  if (node == null) return
+                  val t = node.text?.toString()?.trim() ?: ""
+                  if (t.equals("Off", ignoreCase = true)) {
+                      node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      var p = node.parent
+                      while (p != null) {
+                          if (p.isClickable) {
+                              p.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                              break
+                          }
+                          p = p.parent
+                      }
+                      return
+                  }
+                  for (i in 0 until node.childCount) {
+                      forceClickOffOption(node.getChild(i))
                   }
               }
 
@@ -857,13 +889,18 @@ jobs:
                   return false
               }
 
-              private fun surgicalBack() {
-                  val now = System.currentTimeMillis()
-                  if (now - lastBlockTime < 300) return
-                  lastBlockTime = now
+              private fun surgicalBack(multiPulse: Boolean = false) {
+                  // Zero cooldown on GLOBAL_ACTION_BACK so mid-animation events never block post-animation events!
                   performGlobalAction(GLOBAL_ACTION_BACK)
-                  handler.post {
-                      Toast.makeText(applicationContext, "🔒 Protected by PieceS", Toast.LENGTH_SHORT).show()
+                  if (multiPulse) {
+                      handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, 60)
+                  }
+                  val now = System.currentTimeMillis()
+                  if (now - lastToastTime > 1500) {
+                      lastToastTime = now
+                      handler.post {
+                          Toast.makeText(applicationContext, "🔒 Protected by PieceS", Toast.LENGTH_SHORT).show()
+                      }
                   }
               }
 
@@ -895,5 +932,5 @@ jobs:
       - name: Upload PieceS APK
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-v3.4-APK
+          name: PieceS-v3.5-APK
           path: app/build/outputs/apk/debug/app-debug.apk
