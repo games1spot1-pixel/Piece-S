@@ -20,7 +20,7 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Generate Piece S v3.2 Project
+      - name: Generate Piece S v3.4 Project
         run: |
           mkdir -p app/src/main/java/com/pieces/app
           mkdir -p app/src/main/res/xml
@@ -62,8 +62,8 @@ jobs:
                   applicationId "com.pieces.app"
                   minSdk 24
                   targetSdk 33
-                  versionCode 6
-                  versionName "3.2 [PIECES_APPINFO_GUARD]"
+                  versionCode 8
+                  versionName "3.4 [PIECES_APPINFO_GUARD]"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -122,6 +122,13 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <activity
+                      android:name=".AutoReconnectActivity"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar"
+                      android:excludeFromRecents="true"
+                      android:noHistory="true"
+                      android:exported="false" />
 
                   <service
                       android:name=".DohVpnService"
@@ -213,7 +220,7 @@ jobs:
                   scroll.addView(layout)
 
                   val title = TextView(this).apply {
-                      text = "Piece S v3.2: Fortress Edition"
+                      text = "Piece S v3.4: Fortress Edition"
                       textSize = 20f
                   }
                   layout.addView(title)
@@ -380,10 +387,51 @@ jobs:
               }
           }
 
+          // Invisible 0ms helper that automatically reclaims VPN permission if stolen by a pre-authorized VPN
+          class AutoReconnectActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val intent = VpnService.prepare(this)
+                  if (intent != null) {
+                      startActivityForResult(intent, 200)
+                  } else {
+                      startService(Intent(this, DohVpnService::class.java))
+                      finish()
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (requestCode == 200 && resultCode == RESULT_OK) {
+                      startService(Intent(this, DohVpnService::class.java))
+                  }
+                  finish()
+              }
+          }
+
           class DohVpnService : VpnService() {
               companion object {
                   @Volatile var isRunning = false
                   @Volatile var queriesCount = 0
+                  @Volatile var lastAutoReconnectTime = 0L
+
+                  fun ensureVpnRunning(context: Context) {
+                      val prefs = context.getSharedPreferences("pieces_prefs", MODE_PRIVATE)
+                      val dnsId = prefs.getString("dns_id", "") ?: ""
+                      if (!prefs.getBoolean("locked", false) || dnsId.isEmpty() || isRunning) return
+
+                      if (prepare(context) == null) {
+                          context.startService(Intent(context, DohVpnService::class.java))
+                      } else {
+                          val now = System.currentTimeMillis()
+                          if (now - lastAutoReconnectTime > 3000) {
+                              lastAutoReconnectTime = now
+                              val reclaimIntent = Intent(context, AutoReconnectActivity::class.java).apply {
+                                  addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                              }
+                              context.startActivity(reclaimIntent)
+                          }
+                      }
+                  }
 
                   val httpClient: OkHttpClient = OkHttpClient.Builder()
                       .connectTimeout(5, TimeUnit.SECONDS)
@@ -503,10 +551,7 @@ jobs:
 
               override fun onRevoke() {
                   stopCurrentTunnel()
-                  val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
-                  if (prefs.getBoolean("locked", false)) {
-                      startService(Intent(this, DohVpnService::class.java))
-                  }
+                  ensureVpnRunning(this)
                   super.onRevoke()
               }
 
@@ -578,13 +623,8 @@ jobs:
 
               private val watchdog = object : Runnable {
                   override fun run() {
-                      val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
-                      if (prefs.getBoolean("locked", false) && !DohVpnService.isRunning) {
-                          if (VpnService.prepare(this@LockAccessibilityService) == null) {
-                              startService(Intent(this@LockAccessibilityService, DohVpnService::class.java))
-                          }
-                      }
-                      handler.postDelayed(this, 1500)
+                      DohVpnService.ensureVpnRunning(this@LockAccessibilityService)
+                      handler.postDelayed(this, 1000)
                   }
               }
 
@@ -608,14 +648,32 @@ jobs:
                       return
                   }
 
-                  // 2. Direct System VPN Disconnect Dialog (com.android.vpndialogs)
+                  // 2. LOOPHOLE 3: System VPN Dialogs (com.android.vpndialogs)
+                  //    - Blocks disconnecting PieceS
+                  //    - Blocks ANY other VPN app from getting permission to connect
+                  //    - Automatically clicks "OK" if PieceS is reclaiming a stolen VPN tunnel
                   if (activePkg.contains("vpndialogs", true)) {
                       val sb = StringBuilder()
                       val ids = StringBuilder()
                       collectNodeData(root, sb, ids)
-                      if (sb.toString().contains("PieceS", true)) {
+                      val dialogText = sb.toString()
+
+                      if (dialogText.contains("Disconnect", true) ||
+                          dialogText.contains("session", true) ||
+                          dialogText.contains("activated by PieceS", true)) {
                           surgicalBack()
+                          return
                       }
+
+                      if (dialogText.contains("PieceS", true) && !dialogText.contains("replace PieceS", true)) {
+                          val okButtons = root.findAccessibilityNodeInfosByViewId("android:id/button1")
+                          if (!okButtons.isNullOrEmpty()) {
+                              okButtons[0].performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                              return
+                          }
+                      }
+
+                      surgicalBack()
                       return
                   }
 
@@ -628,19 +686,43 @@ jobs:
                       return
                   }
 
-                  // 4. Only inspect Settings / Security / PackageInstaller / Device Care windows
                   val isSettingsApp = activePkg.contains("settings", true) ||
                       activePkg.contains("packageinstaller", true) ||
                       activePkg.contains("security", true) ||
                       activePkg.contains("miui", true) ||
                       activePkg.contains("lool", true) ||
-                      activePkg.contains("systemmanager", true)
+                      activePkg.contains("systemmanager", true) ||
+                      activePkg.contains("wirelesssettings", true)
 
-                  if (!isSettingsApp) return
+                  // 4. LOOPHOLE 2: All Browsers Internal "Secure DNS" / "DNS over HTTPS" Settings Block
+                  if (!isSettingsApp) {
+                      if (!hasWebView(root)) {
+                          val browserSb = StringBuilder()
+                          val browserIds = StringBuilder()
+                          collectNodeData(root, browserSb, browserIds)
+                          val bScreen = browserSb.toString()
 
+                          val isChromiumSecureDnsPage =
+                              bScreen.contains("Use secure DNS", true) &&
+                              (bScreen.contains("Choose another provider", true) ||
+                               bScreen.contains("current service provider", true))
+
+                          val isFirefoxDohPage =
+                              bScreen.contains("DNS over HTTPS", true) &&
+                              (bScreen.contains("Default Protection", true) ||
+                               bScreen.contains("Increased Protection", true) ||
+                               bScreen.contains("Max Protection", true))
+
+                          if (isChromiumSecureDnsPage || isFirefoxDohPage) {
+                              surgicalBack()
+                          }
+                      }
+                      return
+                  }
+
+                  // 5. Inside Settings / Security / PackageInstaller
                   val clsName = event?.className?.toString() ?: ""
 
-                  // 5. Direct Click Intercept inside Settings for "PieceS Admin"
                   if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
                       val clickedText = (event.text?.joinToString(" ") ?: "") + " " + (event.contentDescription?.toString() ?: "")
                       if (clickedText.contains("PieceS Admin", true)) {
@@ -649,7 +731,6 @@ jobs:
                       }
                   }
 
-                  // 6. Activity Class Name Check for Battery or Language Screen
                   if (clsName.contains("PowerUsage", true) ||
                       clsName.contains("BatterySettings", true) ||
                       clsName.contains("FuelGauge", true) ||
@@ -658,7 +739,8 @@ jobs:
                       clsName.contains("LanguageAndInput", true) ||
                       clsName.contains("LocalePicker", true) ||
                       clsName.contains("AppLocalePicker", true) ||
-                      clsName.contains("LanguageSettings", true)) {
+                      clsName.contains("LanguageSettings", true) ||
+                      clsName.contains("PrivateDns", true)) {
                       surgicalBack()
                       return
                   }
@@ -669,7 +751,7 @@ jobs:
                   val screen = sb.toString()
                   val viewIds = ids.toString()
 
-                  // TARGET A: Accessibility Toggle Sub-Page for PieceS (Exact working v3.0 logic)
+                  // TARGET A: Accessibility Toggle Sub-Page for PieceS
                   if (screen.contains("[PIECES_ACC_GUARD]")) {
                       surgicalBack()
                       return
@@ -681,7 +763,7 @@ jobs:
                       return
                   }
 
-                  // TARGET B: Device Admin Deactivation Sub-Page ONLY (Never triggers on the Device Admin list)
+                  // TARGET B: Device Admin Deactivation Sub-Page ONLY
                   val isDeviceAdminSubPage = clsName.contains("DeviceAdminAdd", true) ||
                       viewIds.contains("admin_warning", true) ||
                       viewIds.contains("admin_policies", true) ||
@@ -695,13 +777,13 @@ jobs:
                       return
                   }
 
-                  // TARGET C: App Info Sub-Page for PieceS (Exact working v3.0 logic)
+                  // TARGET C: App Info Sub-Page for PieceS
                   if (screen.contains("[PIECES_APPINFO_GUARD]")) {
                       surgicalBack()
                       return
                   }
 
-                  // TARGET D: VPN Settings Disconnect Dialog / Sub-Page for PieceS (Exact working v3.0 logic)
+                  // TARGET D: VPN Settings Disconnect / Connect Another VPN Dialog
                   if (screen.contains("PieceS") &&
                       (screen.contains("Disconnect", true) ||
                        screen.contains("Forget VPN", true) ||
@@ -731,7 +813,7 @@ jobs:
                       return
                   }
 
-                  // TARGET F: ENTIRE LANGUAGE SECTION BLOCK (Prevents changing phone language out of English)
+                  // TARGET F: ENTIRE LANGUAGE SECTION BLOCK
                   val isInsideLanguageSection =
                       viewIds.contains("add_language", true) ||
                       viewIds.contains("locale_recycler_view", true) ||
@@ -748,6 +830,31 @@ jobs:
                       surgicalBack()
                       return
                   }
+
+                  // TARGET G: PRIVATE DNS SUB-PAGE / DIALOG BLOCK (Matches your exact screenshot + stock Android)
+                  val isInsidePrivateDns =
+                      viewIds.contains("private_dns_mode", true) ||
+                      viewIds.contains("private_dns_help", true) ||
+                      screen.contains("Specified DNS", true) ||
+                      screen.contains("Use encryption when transmitting DNS requests", true) ||
+                      screen.contains("Encrypt transmissions automatically", true) ||
+                      screen.contains("Private DNS provider hostname", true) ||
+                      screen.contains("Select Private DNS mode", true)
+
+                  if (isInsidePrivateDns) {
+                      surgicalBack()
+                      return
+                  }
+              }
+
+              private fun hasWebView(node: AccessibilityNodeInfo?): Boolean {
+                  if (node == null) return false
+                  val cls = node.className?.toString() ?: ""
+                  if (cls.contains("WebView", true) || cls.contains("geckoview", true)) return true
+                  for (i in 0 until node.childCount) {
+                      if (hasWebView(node.getChild(i))) return true
+                  }
+                  return false
               }
 
               private fun surgicalBack() {
@@ -775,10 +882,7 @@ jobs:
 
           class BootReceiver : BroadcastReceiver() {
               override fun onReceive(context: Context, intent: Intent?) {
-                  val prefs = context.getSharedPreferences("pieces_prefs", Context.MODE_PRIVATE)
-                  if (prefs.getBoolean("locked", false) && VpnService.prepare(context) == null) {
-                      context.startService(Intent(context, DohVpnService::class.java))
-                  }
+                  DohVpnService.ensureVpnRunning(context)
               }
           }
 
@@ -791,5 +895,5 @@ jobs:
       - name: Upload PieceS APK
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-v3.2-APK
+          name: PieceS-v3.4-APK
           path: app/build/outputs/apk/debug/app-debug.apk
