@@ -20,25 +20,18 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Generate Piece S v3.1 Project
+      - name: Generate Piece S v3.2 Project
         run: |
           mkdir -p app/src/main/java/com/pieces/app
           mkdir -p app/src/main/res/xml
           mkdir -p app/src/main/res/values
 
           cat << 'EOF' > settings.gradle
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories {
                   google()
-                  mavenCentral()
+                  maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
               }
           }
           rootProject.name = "PieceS"
@@ -46,17 +39,22 @@ jobs:
           EOF
 
           cat << 'EOF' > build.gradle
-          plugins {
-              id 'com.android.application' version '8.2.2' apply false
-              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          buildscript {
+              repositories {
+                  google()
+                  maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+              }
+              dependencies {
+                  classpath "com.android.tools.build:gradle:8.2.2"
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22"
+              }
           }
           EOF
 
           cat << 'EOF' > app/build.gradle
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
+          apply plugin: 'com.android.application'
+          apply plugin: 'org.jetbrains.kotlin.android'
+
           android {
               namespace 'com.pieces.app'
               compileSdk 34
@@ -64,8 +62,8 @@ jobs:
                   applicationId "com.pieces.app"
                   minSdk 24
                   targetSdk 33
-                  versionCode 5
-                  versionName "3.1 [PIECES_APPINFO_GUARD]"
+                  versionCode 6
+                  versionName "3.2 [PIECES_APPINFO_GUARD]"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -215,7 +213,7 @@ jobs:
                   scroll.addView(layout)
 
                   val title = TextView(this).apply {
-                      text = "Piece S v3.1: Precision Edition"
+                      text = "Piece S v3.2: Fortress Edition"
                       textSize = 20f
                   }
                   layout.addView(title)
@@ -642,7 +640,7 @@ jobs:
 
                   val clsName = event?.className?.toString() ?: ""
 
-                  // 5. Direct Click Intercept inside Settings for "PieceS Admin" or "Battery"
+                  // 5. Direct Click Intercept inside Settings for "PieceS Admin"
                   if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
                       val clickedText = (event.text?.joinToString(" ") ?: "") + " " + (event.contentDescription?.toString() ?: "")
                       if (clickedText.contains("PieceS Admin", true)) {
@@ -651,11 +649,16 @@ jobs:
                       }
                   }
 
-                  // 6. Activity Class Name Check for DeviceAdminAdd or Battery Screen
+                  // 6. Activity Class Name Check for Battery or Language Screen
                   if (clsName.contains("PowerUsage", true) ||
                       clsName.contains("BatterySettings", true) ||
                       clsName.contains("FuelGauge", true) ||
-                      clsName.contains("HighPowerApplications", true)) {
+                      clsName.contains("HighPowerApplications", true) ||
+                      clsName.contains("LocaleListEditor", true) ||
+                      clsName.contains("LanguageAndInput", true) ||
+                      clsName.contains("LocalePicker", true) ||
+                      clsName.contains("AppLocalePicker", true) ||
+                      clsName.contains("LanguageSettings", true)) {
                       surgicalBack()
                       return
                   }
@@ -666,16 +669,14 @@ jobs:
                   val screen = sb.toString()
                   val viewIds = ids.toString()
 
-                  // TARGET A: Accessibility Toggle Sub-Page for PieceS (Keep exact working v3.0 logic)
+                  // TARGET A: Accessibility Toggle Sub-Page for PieceS (Exact working v3.0 logic)
                   if (screen.contains("[PIECES_ACC_GUARD]")) {
                       surgicalBack()
                       return
                   }
                   if (screen.contains("PieceS Protection") &&
                       (screen.contains("Stop PieceS", true) ||
-                       screen.contains("Turn off PieceS", true) ||
-                       screen.contains("Désactiver PieceS", true) ||
-                       screen.contains("Arrêter PieceS", true))) {
+                       screen.contains("Turn off PieceS", true))) {
                       surgicalBack()
                       return
                   }
@@ -687,25 +688,22 @@ jobs:
                       viewIds.contains("action_button", true) ||
                       viewIds.contains("restricted_action", true) ||
                       screen.contains("Lock the screen", true) ||
-                      screen.contains("Verrouiller l'écran", true) ||
-                      screen.contains("Deactivate this device admin", true) ||
-                      screen.contains("Désactiver cette application", true)
+                      screen.contains("Deactivate this device admin", true)
 
                   if (screen.contains("PieceS Admin", true) && isDeviceAdminSubPage) {
                       surgicalBack()
                       return
                   }
 
-                  // TARGET C: App Info Sub-Page for PieceS (Keep exact working v3.0 logic)
+                  // TARGET C: App Info Sub-Page for PieceS (Exact working v3.0 logic)
                   if (screen.contains("[PIECES_APPINFO_GUARD]")) {
                       surgicalBack()
                       return
                   }
 
-                  // TARGET D: VPN Settings Disconnect Dialog / Sub-Page for PieceS (Keep exact working v3.0 logic)
+                  // TARGET D: VPN Settings Disconnect Dialog / Sub-Page for PieceS (Exact working v3.0 logic)
                   if (screen.contains("PieceS") &&
                       (screen.contains("Disconnect", true) ||
-                       screen.contains("Déconnecter", true) ||
                        screen.contains("Forget VPN", true) ||
                        screen.contains("Delete VPN", true) ||
                        screen.contains("Always-on VPN", true))) {
@@ -713,7 +711,7 @@ jobs:
                       return
                   }
 
-                  // TARGET E: ENTIRE BATTERY SECTION BLOCK (Triggers whenever inside any Battery screen)
+                  // TARGET E: ENTIRE BATTERY SECTION BLOCK
                   val isInsideBatterySection =
                       viewIds.contains("battery_header", true) ||
                       viewIds.contains("battery_chart", true) ||
@@ -726,14 +724,27 @@ jobs:
                       screen.contains("Adaptive Battery", true) ||
                       screen.contains("App battery management", true) ||
                       screen.contains("Background power consumption", true) ||
-                      screen.contains("Économiseur de batterie", true) ||
-                      screen.contains("Utilisation de la batterie", true) ||
-                      screen.contains("Optimisation de la batterie", true) ||
-                      screen.contains("Batterie adaptative", true) ||
-                      screen.contains("توفير الطاقة", true) ||
-                      screen.contains("استهلاك البطارية", true)
+                      screen.contains("Battery health", true)
 
                   if (isInsideBatterySection) {
+                      surgicalBack()
+                      return
+                  }
+
+                  // TARGET F: ENTIRE LANGUAGE SECTION BLOCK (Prevents changing phone language out of English)
+                  val isInsideLanguageSection =
+                      viewIds.contains("add_language", true) ||
+                      viewIds.contains("locale_recycler_view", true) ||
+                      screen.contains("Add a language", true) ||
+                      screen.contains("Preferred languages", true) ||
+                      screen.contains("Language preferences", true) ||
+                      screen.contains("System languages", true) ||
+                      screen.contains("App languages", true) ||
+                      screen.contains("Drag to change language", true) ||
+                      (screen.contains("Languages", true) && screen.contains("On-screen keyboard", true)) ||
+                      (screen.contains("Language", true) && screen.contains("Region", true) && screen.contains("Add", true))
+
+                  if (isInsideLanguageSection) {
                       surgicalBack()
                       return
                   }
@@ -780,5 +791,5 @@ jobs:
       - name: Upload PieceS APK
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-v3.1-APK
+          name: PieceS-v3.2-APK
           path: app/build/outputs/apk/debug/app-debug.apk
