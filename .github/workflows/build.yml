@@ -20,7 +20,7 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Generate Piece S v3.6 Master Project
+      - name: Generate Piece S v3.8 Master Project
         run: |
           mkdir -p app/src/main/java/com/pieces/app
           mkdir -p app/src/main/res/xml
@@ -62,8 +62,8 @@ jobs:
                   applicationId "com.pieces.app"
                   minSdk 24
                   targetSdk 33
-                  versionCode 10
-                  versionName "3.6 [PIECES_APPINFO_GUARD]"
+                  versionCode 12
+                  versionName "3.8 [PIECES_APPINFO_GUARD]"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -169,9 +169,15 @@ jobs:
 
                   <receiver
                       android:name=".BootReceiver"
+                      android:enabled="true"
                       android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="android.intent.action.USER_PRESENT" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                       </intent-filter>
                   </receiver>
               </application>
@@ -220,7 +226,7 @@ jobs:
                   scroll.addView(layout)
 
                   val title = TextView(this).apply {
-                      text = "Piece S v3.6: Master Edition"
+                      text = "Piece S v3.8: Master Edition"
                       textSize = 20f
                   }
                   layout.addView(title)
@@ -317,7 +323,7 @@ jobs:
                           if (!isLocked) {
                               prefs.edit().putBoolean("locked", true).apply()
                               if (VpnService.prepare(this@MainActivity) == null) {
-                                  startService(Intent(this@MainActivity, DohVpnService::class.java))
+                                  DohVpnService.startVpnServiceSafely(this@MainActivity, false)
                               }
                               refreshStatus()
                               Toast.makeText(this@MainActivity, "🔒 Protection LOCKED!", Toast.LENGTH_SHORT).show()
@@ -378,10 +384,7 @@ jobs:
 
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   if (requestCode == 100 && resultCode == RESULT_OK) {
-                      val intent = Intent(this, DohVpnService::class.java).apply {
-                          putExtra("force_restart", true)
-                      }
-                      startService(intent)
+                      DohVpnService.startVpnServiceSafely(this, true)
                       Handler(Looper.getMainLooper()).postDelayed({ refreshStatus() }, 600)
                   }
               }
@@ -390,18 +393,24 @@ jobs:
           class AutoReconnectActivity : Activity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  val intent = VpnService.prepare(this)
-                  if (intent != null) {
-                      startActivityForResult(intent, 200)
-                  } else {
-                      startService(Intent(this, DohVpnService::class.java))
+                  try {
+                      val intent = VpnService.prepare(this)
+                      if (intent != null) {
+                          DohVpnService.reclaimRequestTime = System.currentTimeMillis()
+                          startActivityForResult(intent, 200)
+                      } else {
+                          DohVpnService.startVpnServiceSafely(this, false)
+                          finish()
+                      }
+                  } catch (_: Exception) {
                       finish()
                   }
               }
 
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  DohVpnService.reclaimRequestTime = 0L
                   if (requestCode == 200 && resultCode == RESULT_OK) {
-                      startService(Intent(this, DohVpnService::class.java))
+                      DohVpnService.startVpnServiceSafely(this, false)
                   }
                   finish()
               }
@@ -412,24 +421,55 @@ jobs:
                   @Volatile var isRunning = false
                   @Volatile var queriesCount = 0
                   @Volatile var lastAutoReconnectTime = 0L
+                  @Volatile var reclaimRequestTime = 0L
 
-                  fun ensureVpnRunning(context: Context) {
-                      val prefs = context.getSharedPreferences("pieces_prefs", MODE_PRIVATE)
-                      val dnsId = prefs.getString("dns_id", "") ?: ""
-                      if (!prefs.getBoolean("locked", false) || dnsId.isEmpty() || isRunning) return
+                  fun startVpnServiceSafely(context: Context, forceRestart: Boolean = false) {
+                      val serviceIntent = Intent(context, DohVpnService::class.java).apply {
+                          if (forceRestart) putExtra("force_restart", true)
+                      }
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              context.startForegroundService(serviceIntent)
+                          } else {
+                              context.startService(serviceIntent)
+                          }
+                      } catch (_: Exception) {
+                          launchReclaimActivity(context)
+                      }
+                  }
 
-                      if (prepare(context) == null) {
-                          context.startService(Intent(context, DohVpnService::class.java))
-                      } else {
+                  private fun launchReclaimActivity(context: Context) {
+                      try {
                           val now = System.currentTimeMillis()
-                          if (now - lastAutoReconnectTime > 3000) {
+                          if (now - lastAutoReconnectTime > 2000) {
                               lastAutoReconnectTime = now
+                              reclaimRequestTime = now
                               val reclaimIntent = Intent(context, AutoReconnectActivity::class.java).apply {
                                   addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
                               }
                               context.startActivity(reclaimIntent)
                           }
-                      }
+                      } catch (_: Exception) {}
+                  }
+
+                  fun ensureVpnRunning(context: Context) {
+                      try {
+                          val prefs = context.getSharedPreferences("pieces_prefs", MODE_PRIVATE)
+                          val dnsId = prefs.getString("dns_id", "") ?: ""
+                          if (!prefs.getBoolean("locked", false) || dnsId.isEmpty() || isRunning) return
+
+                          if (prepare(context) == null) {
+                              startVpnServiceSafely(context, false)
+                              // If background service start was silently ignored by OEM after boot, fallback to Activity:
+                              Handler(Looper.getMainLooper()).postDelayed({
+                                  if (!isRunning) {
+                                      launchReclaimActivity(context)
+                                  }
+                              }, 1200)
+                          } else {
+                              launchReclaimActivity(context)
+                          }
+                      } catch (_: Exception) {}
                   }
 
                   val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -472,7 +512,23 @@ jobs:
               private var readerThread: Thread? = null
               private val executor = Executors.newCachedThreadPool()
 
+              private fun promoteToForeground() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channelId = "nextdns_shield_channel"
+                      val chan = NotificationChannel(channelId, "DNS Shield", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+                      val notif = Notification.Builder(this, channelId)
+                          .setContentTitle("NextDNS Shield Active")
+                          .setContentText("Encrypted DoH Resolver Running")
+                          .setSmallIcon(android.R.drawable.ic_secure)
+                          .build()
+                      startForeground(1, notif)
+                  }
+              }
+
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  promoteToForeground()
+
                   val forceRestart = intent?.getBooleanExtra("force_restart", false) ?: false
                   if (isRunning && vpnInterface != null && !forceRestart) {
                       return START_STICKY
@@ -483,18 +539,6 @@ jobs:
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
                   val dnsId = prefs.getString("dns_id", "") ?: ""
                   if (dnsId.isEmpty()) return START_NOT_STICKY
-
-                  val channelId = "nextdns_shield_channel"
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val chan = NotificationChannel(channelId, "DNS Shield", NotificationManager.IMPORTANCE_LOW)
-                      getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
-                      val notif = Notification.Builder(this, channelId)
-                          .setContentTitle("NextDNS Shield Active")
-                          .setContentText("Encrypted DoH Resolver Running")
-                          .setSmallIcon(android.R.drawable.ic_secure)
-                          .build()
-                      startForeground(1, notif)
-                  }
 
                   val builder = Builder()
                       .setSession("PieceS")
@@ -509,7 +553,12 @@ jobs:
                       .addDisallowedApplication(packageName)
                       .setMtu(1500)
 
-                  val pfd = builder.establish() ?: return START_STICKY
+                  val pfd = try {
+                      builder.establish()
+                  } catch (_: Exception) {
+                      null
+                  } ?: return START_STICKY
+
                   vpnInterface = pfd
                   isRunning = true
 
@@ -630,15 +679,18 @@ jobs:
               private val handler = Handler(Looper.getMainLooper())
               private var lastToastTime = 0L
 
-              // Battery-Optimized Screen-Aware Watchdog: Zero CPU wakeups when screen is off!
               private val watchdog = object : Runnable {
                   override fun run() {
-                      val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-                      if (pm?.isInteractive != false) {
-                          DohVpnService.ensureVpnRunning(this@LockAccessibilityService)
+                      try {
+                          val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                          if (pm?.isInteractive != false) {
+                              DohVpnService.ensureVpnRunning(this@LockAccessibilityService)
+                              handler.postDelayed(this, 2500)
+                          } else {
+                              handler.postDelayed(this, 10000)
+                          }
+                      } catch (_: Exception) {
                           handler.postDelayed(this, 3000)
-                      } else {
-                          handler.postDelayed(this, 15000)
                       }
                   }
               }
@@ -652,7 +704,10 @@ jobs:
                   val prefs = getSharedPreferences("pieces_prefs", MODE_PRIVATE)
                   if (!prefs.getBoolean("locked", false)) return
 
-                  // Fast package pre-check BEFORE touching rootInActiveWindow (saves 90%+ battery in normal apps!)
+                  if (!DohVpnService.isRunning) {
+                      DohVpnService.ensureVpnRunning(this)
+                  }
+
                   val eventPkg = event?.packageName?.toString() ?: ""
                   if (eventPkg == packageName ||
                       eventPkg.contains("systemui", true) ||
@@ -686,7 +741,6 @@ jobs:
                       eventPkg.contains("kiwi", true) ||
                       eventPkg.contains("duckduckgo", true)
 
-                  // If the user is in WhatsApp, YouTube, Instagram, Games, etc. -> Exit in 0.001ms!
                   if (!isSettingsOrSystem && !isBrowserApp) return
 
                   val root = rootInActiveWindow ?: return
@@ -699,33 +753,22 @@ jobs:
                       return
                   }
 
-                  // 1. System VPN Dialogs (com.android.vpndialogs)
                   if (activePkg.contains("vpndialogs", true)) {
-                      val sb = StringBuilder()
-                      val ids = StringBuilder()
-                      collectNodeData(root, sb, ids)
-                      val dialogText = sb.toString()
-
-                      if (dialogText.contains("Disconnect", true) ||
-                          dialogText.contains("session", true) ||
-                          dialogText.contains("activated by PieceS", true)) {
-                          surgicalBack()
-                          return
-                      }
-
-                      if (dialogText.contains("PieceS", true) && !dialogText.contains("replace PieceS", true)) {
+                      val isOurOwnReclaim = (System.currentTimeMillis() - DohVpnService.reclaimRequestTime) < 4500
+                      if (isOurOwnReclaim) {
                           val okButtons = root.findAccessibilityNodeInfosByViewId("android:id/button1")
                           if (!okButtons.isNullOrEmpty()) {
                               okButtons[0].performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                              return
+                              handler.postDelayed({
+                                  try { okButtons[0].performAction(AccessibilityNodeInfo.ACTION_CLICK) } catch (_: Exception) {}
+                              }, 60)
                           }
+                          return
                       }
-
                       surgicalBack()
                       return
                   }
 
-                  // 2. Dedicated OEM Battery / Power Manager packages -> Block Entirely
                   if (activePkg.contains("powerkeeper", true) ||
                       activePkg.contains("oppoguardelf", true) ||
                       activePkg.contains("oplus.battery", true) ||
@@ -734,7 +777,6 @@ jobs:
                       return
                   }
 
-                  // 3. Browser Internal "Secure DNS" / "DNS over HTTPS" Settings Block
                   if (isBrowserApp && !isSettingsOrSystem) {
                       if (!hasWebView(root)) {
                           val browserSb = StringBuilder()
@@ -760,8 +802,6 @@ jobs:
                       return
                   }
 
-                  // 4. Inside Settings / Security / PackageInstaller:
-                  //    Apply the 0ms Instant Click Intercept + Multi-Pulse Back to VPN, Accessibility, Device Admin, and Private DNS!
                   if (event?.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
                       val clickedText = (event.text?.joinToString(" ") ?: "") + " " + (event.contentDescription?.toString() ?: "")
                       if (clickedText.contains("PieceS", true) ||
@@ -793,7 +833,6 @@ jobs:
                   val screen = sb.toString()
                   val viewIds = ids.toString()
 
-                  // TARGET A: Accessibility Toggle Sub-Page for PieceS
                   if (screen.contains("[PIECES_ACC_GUARD]")) {
                       surgicalBack()
                       return
@@ -805,7 +844,6 @@ jobs:
                       return
                   }
 
-                  // TARGET B: Device Admin Deactivation Sub-Page ONLY
                   val isDeviceAdminSubPage = clsName.contains("DeviceAdminAdd", true) ||
                       viewIds.contains("admin_warning", true) ||
                       viewIds.contains("admin_policies", true) ||
@@ -819,13 +857,11 @@ jobs:
                       return
                   }
 
-                  // TARGET C: App Info Sub-Page for PieceS
                   if (screen.contains("[PIECES_APPINFO_GUARD]")) {
                       surgicalBack()
                       return
                   }
 
-                  // TARGET D: VPN Settings Disconnect / Sub-Page for PieceS
                   if (screen.contains("PieceS") &&
                       (screen.contains("Disconnect", true) ||
                        screen.contains("Forget VPN", true) ||
@@ -835,7 +871,6 @@ jobs:
                       return
                   }
 
-                  // TARGET E: ENTIRE BATTERY SECTION BLOCK
                   val isInsideBatterySection =
                       viewIds.contains("battery_header", true) ||
                       viewIds.contains("battery_chart", true) ||
@@ -855,7 +890,6 @@ jobs:
                       return
                   }
 
-                  // TARGET F: ENTIRE LANGUAGE SECTION BLOCK
                   val isInsideLanguageSection =
                       viewIds.contains("add_language", true) ||
                       viewIds.contains("locale_recycler_view", true) ||
@@ -873,7 +907,6 @@ jobs:
                       return
                   }
 
-                  // TARGET G: PRIVATE DNS SUB-PAGE / DIALOG BLOCK
                   val isInsidePrivateDns =
                       viewIds.contains("private_dns_mode", true) ||
                       viewIds.contains("private_dns_help", true) ||
@@ -899,7 +932,6 @@ jobs:
                   return false
               }
 
-              // Unified 0ms + 60ms Multi-Pulse Back for all targets (VPN, Accessibility, Device Admin, Private DNS)
               private fun surgicalBack() {
                   performGlobalAction(GLOBAL_ACTION_BACK)
                   handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_BACK) }, 60)
@@ -940,5 +972,5 @@ jobs:
       - name: Upload PieceS APK
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-v3.6-APK
+          name: PieceS-v3.8-APK
           path: app/build/outputs/apk/debug/app-debug.apk
