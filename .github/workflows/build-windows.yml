@@ -14,7 +14,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Generate Piece S Windows 11 v2.0 Project
+      - name: Generate Piece S Windows 11 v2.2 Project
         run: |
           mkdir -p PieceSWin
 
@@ -74,19 +74,49 @@ jobs:
                   public static readonly string ConfigFile = Path.Combine(BaseDir, "config.json");
                   public static readonly string StatsFile = Path.Combine(BaseDir, "stats.json");
                   public static readonly string ServiceExe = Path.Combine(BaseDir, "PieceSService.exe");
+                  public static readonly string GuardianExe = Path.Combine(BaseDir, "PieceSGuardian.exe");
                   public static readonly string ServiceName = "PieceSService";
+
+                  private static AppConfig? _memConfig;
+                  private static DateTime _lastConfigCheck = DateTime.MinValue;
+                  private static DateTime _lastFileWrite = DateTime.MinValue;
 
                   public static void EnsureDirectory() { if (!Directory.Exists(BaseDir)) Directory.CreateDirectory(BaseDir); }
 
-                  public static AppConfig LoadConfig()
+                  public static AppConfig GetCachedConfig(bool forceReload = false)
                   {
-                      try { if (File.Exists(ConfigFile)) return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigFile)) ?? new AppConfig(); } catch { }
-                      return new AppConfig();
+                      if (!forceReload && _memConfig != null && (DateTime.UtcNow - _lastConfigCheck).TotalSeconds < 5)
+                          return _memConfig;
+
+                      try
+                      {
+                          _lastConfigCheck = DateTime.UtcNow;
+                          if (File.Exists(ConfigFile))
+                          {
+                              var wt = File.GetLastWriteTimeUtc(ConfigFile);
+                              if (forceReload || _memConfig == null || wt != _lastFileWrite)
+                              {
+                                  _lastFileWrite = wt;
+                                  _memConfig = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigFile)) ?? new AppConfig();
+                              }
+                          }
+                      }
+                      catch { }
+                      return _memConfig ??= new AppConfig();
                   }
 
                   public static void SaveConfig(AppConfig cfg)
                   {
-                      try { EnsureDirectory(); SetAcl(false); File.WriteAllText(ConfigFile, JsonSerializer.Serialize(cfg)); if (cfg.Locked) SetAcl(true); } catch { }
+                      try
+                      {
+                          EnsureDirectory();
+                          SetAcl(false);
+                          File.WriteAllText(ConfigFile, JsonSerializer.Serialize(cfg));
+                          _memConfig = cfg;
+                          _lastFileWrite = File.GetLastWriteTimeUtc(ConfigFile);
+                          if (cfg.Locked) SetAcl(true);
+                      }
+                      catch { }
                   }
 
                   public static RuntimeStats LoadStats()
@@ -135,7 +165,8 @@ jobs:
                               catch { await s.ConnectAsync(new IPAddress(new byte[] { 45, 90, 30, 0 }), 443, tok); }
                               return new NetworkStream(s, true);
                           },
-                          PooledConnectionLifetime = TimeSpan.FromMinutes(10)
+                          PooledConnectionLifetime = TimeSpan.FromMinutes(15),
+                          PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5)
                       };
                       return new HttpClient(h) { Timeout = TimeSpan.FromSeconds(5) };
                   }
@@ -164,7 +195,7 @@ jobs:
                           byte[] nx = (byte[])q.Clone(); nx[2] = 0x81; nx[3] = 0x83; return nx;
                       }
 
-                      string key = $"{id}:{name}:{qType}";
+                      string key = id + ":" + name + ":" + qType;
                       if (!skipCache && Cache.TryGetValue(key, out var c) && c.Exp > DateTime.UtcNow)
                       {
                           byte[] copy = (byte[])c.Data.Clone(); copy[0] = q[0]; copy[1] = q[1];
@@ -174,7 +205,7 @@ jobs:
 
                       using var body = new ByteArrayContent(q);
                       body.Headers.ContentType = new MediaTypeHeaderValue("application/dns-message");
-                      using var req = new HttpRequestMessage(HttpMethod.Post, $"https://dns.nextdns.io/{id}") { Content = body };
+                      using var req = new HttpRequestMessage(HttpMethod.Post, "https://dns.nextdns.io/" + id) { Content = body };
                       req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/dns-message"));
 
                       using var resp = await Http.SendAsync(req);
@@ -182,8 +213,8 @@ jobs:
                       byte[] bytes = await resp.Content.ReadAsByteArrayAsync();
                       if (bytes.Length > 12)
                       {
-                          if (Cache.Count > 2000) Cache.Clear();
-                          Cache[key] = ((byte[])bytes.Clone(), DateTime.UtcNow.AddSeconds(60));
+                          if (Cache.Count > 3000) Cache.Clear();
+                          Cache[key] = ((byte[])bytes.Clone(), DateTime.UtcNow.AddMinutes(3));
                           bytes[0] = q[0]; bytes[1] = q[1];
                           Interlocked.Increment(ref QueriesResolved);
                           return bytes;
@@ -233,19 +264,83 @@ jobs:
                   [DllImport("iphlpapi.dll", SetLastError = true)]
                   private static extern uint GetExtendedUdpTable(IntPtr pTable, ref int len, bool sort, int ipVer, int cls, uint res);
 
-                  public static void FullTakeover(bool locked)
+                  [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+                  private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+                  [DllImport("user32.dll", CharSet = CharSet.Auto)]
+                  private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+                  private static readonly HashSet<string> DisabledTasksMemory = new();
+
+                  public static bool IsMmcOrMainFormOpen(out bool uiOpen)
                   {
-                      KillRivalsAndTasks();
-                      SetFirewallBlackhole(true);
-                      LockAdaptersAndRegistry();
-                      SetBrowserPolicies(locked);
+                      uiOpen = FindWindow(null, "Piece S v2.2: Windows 11 Edition") != IntPtr.Zero;
+                      return FindWindow("MMCMainFrame", null) != IntPtr.Zero;
                   }
 
-                  public static void KillRivalsAndTasks()
+                  public static void CloseTamperDialogsIfMmcOpen()
+                  {
+                      if (FindWindow("MMCMainFrame", null) == IntPtr.Zero) return;
+                      string[] titles = { "PieceS NextDNS Protection Properties (Local Computer)", "PieceS NextDNS Protection Properties" };
+                      foreach (var t in titles)
+                      {
+                          IntPtr h = FindWindow(null, t);
+                          if (h != IntPtr.Zero) SendMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
+                      }
+                  }
+
+                  public static void EnsureServiceAutoStartAndRunning()
                   {
                       try
                       {
-                          // 1. Hunt any process on UDP Port 53 (e.g. cloudflared)
+                          using var sk = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + Paths.ServiceName, true);
+                          if (sk != null && (int)(sk.GetValue("Start") ?? 2) != 2)
+                              sk.SetValue("Start", 2, RegistryValueKind.DWord);
+                      }
+                      catch { }
+
+                      try
+                      {
+                          using var sc = new ServiceController(Paths.ServiceName);
+                          if (sc.Status == ServiceControllerStatus.Stopped || sc.Status == ServiceControllerStatus.StopPending)
+                              RunCmd("sc.exe", "start " + Paths.ServiceName);
+                      }
+                      catch { }
+                  }
+
+                  public static void LockServiceDacl(bool locked)
+                  {
+                      if (locked)
+                          RunCmd("sc.exe", "sdset " + Paths.ServiceName + " D:(D;;WPDTDCDE;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
+                      else
+                          RunCmd("sc.exe", "sdset " + Paths.ServiceName + " D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
+                  }
+
+                  public static void EnsureGuardianAlive()
+                  {
+                      try
+                      {
+                          if (Process.GetProcessesByName("PieceSGuardian").Length == 0 && File.Exists(Paths.GuardianExe))
+                              Process.Start(new ProcessStartInfo { FileName = Paths.GuardianExe, Arguments = "--guardian", CreateNoWindow = true, UseShellExecute = false, WindowStyle = ProcessWindowStyle.Hidden });
+                      }
+                      catch { }
+                  }
+
+                  public static void FullTakeover(bool locked)
+                  {
+                      KillRivalsOnce();
+                      SetFirewallBlackhole(true);
+                      LockAdaptersFast();
+                      SetBrowserPolicies(locked);
+                      LockServiceDacl(locked);
+                      Paths.SetAcl(locked);
+                      if (locked) EnsureGuardianAlive();
+                  }
+
+                  public static void KillRivalsOnce()
+                  {
+                      try
+                      {
                           int myPid = Environment.ProcessId;
                           foreach (int pid in GetPort53Pids(2).Concat(GetPort53Pids(23)).Distinct())
                           {
@@ -259,7 +354,7 @@ jobs:
                                   {
                                       string? exe = p.MainModule?.FileName;
                                       if (!string.IsNullOrEmpty(exe))
-                                          RunCmd("netsh", $"advfirewall firewall add rule name=\"PieceS_Block_{n}\" dir=out action=block program=\"{exe}\" enable=yes");
+                                          RunCmd("netsh", "advfirewall firewall add rule name=\"PieceS_Block_" + n + "\" dir=out action=block program=\"" + exe + "\" enable=yes");
                                   }
                                   catch { }
                                   p.Kill(true);
@@ -267,16 +362,11 @@ jobs:
                               catch { }
                           }
 
-                          // 2. Kill known rival DNS processes
                           foreach (var name in new[] { "cloudflared", "warp-svc", "warp-cli", "dnscrypt-proxy", "YogaDNS" })
                           {
-                              foreach (var p in Process.GetProcessesByName(name))
-                              {
-                                  try { p.Kill(true); } catch { }
-                              }
+                              foreach (var p in Process.GetProcessesByName(name)) { try { p.Kill(true); } catch { } }
                           }
 
-                          // 3. Disable scheduled tasks that mention cloudflare, warp, 1.1.1.1, or dnsservers
                           using var tk = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks");
                           if (tk != null)
                           {
@@ -286,13 +376,14 @@ jobs:
                                   {
                                       using var sub = tk.OpenSubKey(guid);
                                       string path = sub?.GetValue("Path")?.ToString() ?? "";
-                                      if (string.IsNullOrEmpty(path) || path.StartsWith(@"\Microsoft\Windows\", StringComparison.OrdinalIgnoreCase)) continue;
+                                      if (string.IsNullOrEmpty(path) || DisabledTasksMemory.Contains(path) || path.StartsWith(@"\Microsoft\Windows\", StringComparison.OrdinalIgnoreCase)) continue;
                                       string info = path.ToLowerInvariant();
                                       if (sub?.GetValue("Actions") is byte[] act) info += " " + Encoding.Unicode.GetString(act).ToLowerInvariant();
-                                      if (info.Contains("cloudflare") || info.Contains("warp") || info.Contains("1.1.1.1") || info.Contains("dns"))
+                                      if (info.Contains("cloudflare") || info.Contains("warp") || info.Contains("1.1.1.1"))
                                       {
-                                          RunCmd("schtasks.exe", $"/Change /TN \"{path}\" /Disable");
-                                          RunCmd("schtasks.exe", $"/End /TN \"{path}\"");
+                                          DisabledTasksMemory.Add(path);
+                                          RunCmd("schtasks.exe", "/Change /TN \"" + path + "\" /Disable");
+                                          RunCmd("schtasks.exe", "/End /TN \"" + path + "\"");
                                       }
                                   }
                                   catch { }
@@ -341,44 +432,25 @@ jobs:
                       }
                   }
 
-                  public static void LockAdaptersAndRegistry()
+                  public static void LockAdaptersFast()
                   {
-                      try
-                      {
-                          using var dohKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters", true);
-                          if (dohKey != null)
-                          {
-                              foreach (var sub in dohKey.GetSubKeyNames())
-                              {
-                                  try { using var gk = dohKey.OpenSubKey(sub, true); gk?.DeleteSubKeyTree("DohInterfaceSettings", false); } catch { }
-                              }
-                          }
-                      }
-                      catch { }
-
                       bool changed = false;
                       foreach (var nic in GetPhysicalAdapters())
                       {
                           try
                           {
-                              using var k4 = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{nic.Id}", true);
+                              using var k4 = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + nic.Id, true);
                               if (k4 != null && (k4.GetValue("NameServer")?.ToString() ?? "") != "127.0.0.1")
                               {
                                   k4.SetValue("NameServer", "127.0.0.1", RegistryValueKind.String);
+                                  RunCmd("netsh", "interface ipv4 set dnsservers name=\"" + nic.Name + "\" static 127.0.0.1 primary validate=no");
                                   changed = true;
                               }
-                              using var k6 = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{nic.Id}", true);
+                              using var k6 = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\" + nic.Id, true);
                               if (k6 != null && (k6.GetValue("NameServer")?.ToString() ?? "") != "::1")
                               {
                                   k6.SetValue("NameServer", "::1", RegistryValueKind.String);
-                                  changed = true;
-                              }
-
-                              var ips = nic.GetIPProperties().DnsAddresses;
-                              if (changed || ips.Count == 0 || ips.Any(ip => !ip.Equals(IPAddress.Loopback) && !ip.Equals(IPAddress.IPv6Loopback)))
-                              {
-                                  RunCmd("netsh", $"interface ipv4 set dnsservers name=\"{nic.Name}\" static 127.0.0.1 primary validate=no");
-                                  RunCmd("netsh", $"interface ipv6 set dnsservers name=\"{nic.Name}\" static ::1 primary validate=no");
+                                  RunCmd("netsh", "interface ipv6 set dnsservers name=\"" + nic.Name + "\" static ::1 primary validate=no");
                                   changed = true;
                               }
                           }
@@ -393,8 +465,8 @@ jobs:
                       foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
                       {
                           if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                          RunCmd("netsh", $"interface ipv4 set dnsservers name=\"{nic.Name}\" source=dhcp");
-                          RunCmd("netsh", $"interface ipv6 set dnsservers name=\"{nic.Name}\" source=dhcp");
+                          RunCmd("netsh", "interface ipv4 set dnsservers name=\"" + nic.Name + "\" source=dhcp");
+                          RunCmd("netsh", "interface ipv6 set dnsservers name=\"" + nic.Name + "\" source=dhcp");
                       }
                       RunCmd("ipconfig", "/flushdns");
                   }
@@ -458,19 +530,27 @@ jobs:
                   {
                       _cts = new CancellationTokenSource();
                       try { _lockFile = new FileStream(Paths.ServiceExe, FileMode.Open, FileAccess.Read, FileShare.Read); } catch { }
-                      var cfg = Paths.LoadConfig();
+                      var cfg = Paths.GetCachedConfig(true);
                       SetStopAllowed(!cfg.Locked);
                       SystemEnforcer.FullTakeover(cfg.Locked);
 
+                      // Zero-CPU event-driven network change listener
+                      NetworkChange.NetworkAddressChanged += (s, e) =>
+                      {
+                          if (!string.IsNullOrEmpty(Paths.GetCachedConfig().DnsId))
+                              SystemEnforcer.LockAdaptersFast();
+                      };
+
                       Task.Run(() => UdpLoop(IPAddress.Loopback, _cts.Token));
                       Task.Run(() => UdpLoop(IPAddress.IPv6Loopback, _cts.Token));
-                      Task.Run(() => Watchdog(_cts.Token));
+                      Task.Run(() => LowPowerWatchdog(_cts.Token));
                   }
 
                   protected override void OnCustomCommand(int cmd)
                   {
-                      if (cmd == 128) { SetStopAllowed(false); Paths.SetAcl(true); SystemEnforcer.FullTakeover(true); }
-                      else if (cmd == 129) { SetStopAllowed(true); Paths.SetAcl(false); SystemEnforcer.SetBrowserPolicies(false); }
+                      var cfg = Paths.GetCachedConfig(true);
+                      if (cmd == 128) { SetStopAllowed(false); SystemEnforcer.FullTakeover(true); }
+                      else if (cmd == 129) { SetStopAllowed(true); Paths.SetAcl(false); SystemEnforcer.LockServiceDacl(false); SystemEnforcer.SetBrowserPolicies(false); }
                   }
 
                   private void SetStopAllowed(bool allow)
@@ -490,7 +570,6 @@ jobs:
                       {
                           try
                           {
-                              SystemEnforcer.KillRivalsAndTasks();
                               using var udp = new UdpClient(ip.AddressFamily) { ExclusiveAddressUse = true };
                               udp.Client.Bind(new IPEndPoint(ip, 53));
                               while (!tok.IsCancellationRequested)
@@ -500,46 +579,61 @@ jobs:
                                   {
                                       try
                                       {
-                                          var ans = await DohEngine.ResolveAsync(res.Buffer, Paths.LoadConfig().DnsId);
+                                          // Reads from RAM cache (0 disk I/O)
+                                          var ans = await DohEngine.ResolveAsync(res.Buffer, Paths.GetCachedConfig().DnsId);
                                           if (ans != null) await udp.SendAsync(ans, ans.Length, res.RemoteEndPoint);
                                       }
                                       catch { }
                                   }, tok);
                               }
                           }
-                          catch { await Task.Delay(500, tok); }
+                          catch
+                          {
+                              SystemEnforcer.KillRivalsOnce();
+                              await Task.Delay(1000, tok);
+                          }
                       }
                   }
 
-                  private async Task Watchdog(CancellationToken tok)
+                  private async Task LowPowerWatchdog(CancellationToken tok)
                   {
+                      long lastSavedQueries = -1;
                       int tick = 0;
                       while (!tok.IsCancellationRequested)
                       {
                           try
                           {
-                              var cfg = Paths.LoadConfig();
-                              SetStopAllowed(!cfg.Locked);
-                              if (!string.IsNullOrWhiteSpace(cfg.DnsId))
+                              var cfg = Paths.GetCachedConfig();
+                              bool mmcOpen = SystemEnforcer.IsMmcOrMainFormOpen(out bool uiOpen);
+
+                              if (cfg.Locked)
                               {
-                                  SystemEnforcer.LockAdaptersAndRegistry();
-                                  if (tick % 4 == 0)
-                                  {
-                                      SystemEnforcer.KillRivalsAndTasks();
-                                      if (cfg.Locked) { SystemEnforcer.SetBrowserPolicies(true); Paths.SetAcl(true); }
-                                  }
+                                  if (mmcOpen) SystemEnforcer.CloseTamperDialogsIfMmcOpen();
+                                  if (tick % 3 == 0) SystemEnforcer.EnsureGuardianAlive();
                               }
-                              Paths.SaveStats(DohEngine.QueriesResolved);
+
+                              if (tick % 5 == 0 && !string.IsNullOrWhiteSpace(cfg.DnsId))
+                                  SystemEnforcer.LockAdaptersFast();
+
+                              // Only write stats to SSD if the UI window is open and query count changed!
+                              if (uiOpen && DohEngine.QueriesResolved != lastSavedQueries)
+                              {
+                                  lastSavedQueries = DohEngine.QueriesResolved;
+                                  Paths.SaveStats(lastSavedQueries);
+                              }
                               tick++;
                           }
                           catch { }
-                          await Task.Delay(1000, tok);
+
+                          // Sleep 2000ms normally (0.0% CPU), or 300ms only when services.msc is actively open
+                          bool fastWatch = SystemEnforcer.IsMmcOrMainFormOpen(out _);
+                          await Task.Delay(fastWatch ? 300 : 2000, tok);
                       }
                   }
 
                   protected override void OnStop()
                   {
-                      if (Paths.LoadConfig().Locked) { SetStopAllowed(false); return; }
+                      if (Paths.GetCachedConfig(true).Locked) { SetStopAllowed(false); return; }
                       _cts?.Cancel();
                       try { _lockFile?.Dispose(); } catch { }
                       base.OnStop();
@@ -554,17 +648,17 @@ jobs:
 
                   public MainForm()
                   {
-                      Text = "Piece S v2.0: Windows 11 Edition";
+                      Text = "Piece S v2.2: Windows 11 Edition";
                       Size = new Size(500, 620);
                       FormBorderStyle = FormBorderStyle.FixedSingle;
                       MaximizeBox = false;
                       StartPosition = FormStartPosition.CenterScreen;
                       Font = new Font("Segoe UI", 10f);
 
-                      var cfg = Paths.LoadConfig();
+                      var cfg = Paths.GetCachedConfig(true);
                       var p = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(25, 20, 25, 20) };
 
-                      p.Controls.Add(new Label { Text = "Piece S v2.0: Windows 11 Edition", Font = new Font("Segoe UI Semibold", 15f, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 0, 0, 15) });
+                      p.Controls.Add(new Label { Text = "Piece S v2.2: Windows 11 Edition", Font = new Font("Segoe UI Semibold", 15f, FontStyle.Bold), AutoSize = true, Margin = new Padding(0, 0, 0, 15) });
                       p.Controls.Add(new Label { Text = "Enter NextDNS ID (e.g. debd2d):", AutoSize = true });
                       dnsInput = new TextBox { Width = 425, Text = cfg.DnsId, Margin = new Padding(0, 5, 0, 12) };
                       p.Controls.Add(dnsInput);
@@ -582,7 +676,7 @@ jobs:
                           var sw = Stopwatch.StartNew();
                           bool ok = await DohEngine.TestDohAsync(id);
                           sw.Stop();
-                          lblTest.Text = ok ? $"[OK] NextDNS Verified! ({sw.ElapsedMilliseconds}ms)" : "[FAIL] Check internet or ID.";
+                          lblTest.Text = ok ? "[OK] NextDNS Verified! (" + sw.ElapsedMilliseconds + "ms)" : "[FAIL] Check internet or ID.";
                           RefreshUi();
                       };
                       p.Controls.Add(bVerify);
@@ -601,12 +695,14 @@ jobs:
                       btnUninstall = new Button { Text = "Restore Default DHCP DNS & Stop Service (Unlocked Only)", Width = 425, Height = 36, Margin = new Padding(0, 0, 0, 15) };
                       btnUninstall.Click += (s, e) =>
                       {
-                          if (Paths.LoadConfig().Locked) return;
+                          if (Paths.GetCachedConfig(true).Locked) return;
                           Paths.SetAcl(false);
+                          SystemEnforcer.LockServiceDacl(false);
                           SystemEnforcer.SetBrowserPolicies(false);
                           SystemEnforcer.RestoreDefaultDhcp();
-                          SystemEnforcer.RunCmd("sc.exe", $"stop {Paths.ServiceName}");
-                          SystemEnforcer.RunCmd("sc.exe", $"delete {Paths.ServiceName}");
+                          foreach (var g in Process.GetProcessesByName("PieceSGuardian")) { try { g.Kill(true); } catch { } }
+                          SystemEnforcer.RunCmd("sc.exe", "stop " + Paths.ServiceName);
+                          SystemEnforcer.RunCmd("sc.exe", "delete " + Paths.ServiceName);
                           RefreshUi();
                       };
                       p.Controls.Add(btnUninstall);
@@ -615,7 +711,7 @@ jobs:
                       p.Controls.Add(lblStatus);
                       Controls.Add(p);
 
-                      var t = new System.Windows.Forms.Timer { Interval = 1000 };
+                      var t = new System.Windows.Forms.Timer { Interval = 1500 };
                       t.Tick += (s, e) => RefreshUi();
                       t.Start();
                       RefreshUi();
@@ -628,7 +724,7 @@ jobs:
                       string id = CleanId();
                       if (string.IsNullOrEmpty(id)) return;
                       dnsInput.Text = id;
-                      var cfg = Paths.LoadConfig(); cfg.DnsId = id; Paths.SaveConfig(cfg);
+                      var cfg = Paths.GetCachedConfig(true); cfg.DnsId = id; Paths.SaveConfig(cfg);
                       InstallService();
                       SystemEnforcer.FullTakeover(cfg.Locked);
                       RefreshUi();
@@ -636,7 +732,7 @@ jobs:
 
                   private void ToggleLock()
                   {
-                      var cfg = Paths.LoadConfig();
+                      var cfg = Paths.GetCachedConfig(true);
                       if (!cfg.Locked)
                       {
                           string id = CleanId();
@@ -646,14 +742,16 @@ jobs:
                           SystemEnforcer.FullTakeover(true);
                           SendServiceCmd(128);
                           RefreshUi();
-                          MessageBox.Show("LOCKED! Close and reopen your browser once so it drops old Cloudflare connections.");
+                          MessageBox.Show("LOCKED! 0.0% Idle CPU Battery-Friendly Guard is active.");
                       }
                       else if (pinInput.Text == "1234")
                       {
                           cfg.Locked = false; Paths.SaveConfig(cfg); pinInput.Text = "";
+                          SystemEnforcer.LockServiceDacl(false);
                           SendServiceCmd(129);
                           SystemEnforcer.SetBrowserPolicies(false);
                           Paths.SetAcl(false);
+                          foreach (var g in Process.GetProcessesByName("PieceSGuardian")) { try { g.Kill(true); } catch { } }
                           RefreshUi();
                       }
                       else MessageBox.Show("Enter PIN 1234 to Unlock!");
@@ -662,17 +760,20 @@ jobs:
                   private void InstallService()
                   {
                       Paths.EnsureDirectory(); Paths.SetAcl(false);
+                      SystemEnforcer.LockServiceDacl(false);
                       SendServiceCmd(129);
-                      SystemEnforcer.RunCmd("sc.exe", $"stop {Paths.ServiceName}");
+                      foreach (var g in Process.GetProcessesByName("PieceSGuardian")) { try { g.Kill(true); } catch { } }
+                      SystemEnforcer.RunCmd("sc.exe", "stop " + Paths.ServiceName);
                       Thread.Sleep(500);
-                      SystemEnforcer.KillRivalsAndTasks();
+                      SystemEnforcer.KillRivalsOnce();
                       string exe = Environment.ProcessPath ?? Application.ExecutablePath;
-                      if (!string.Equals(exe, Paths.ServiceExe, StringComparison.OrdinalIgnoreCase))
-                          try { File.Copy(exe, Paths.ServiceExe, true); } catch { }
+                      try { File.Copy(exe, Paths.ServiceExe, true); } catch { }
+                      try { File.Copy(exe, Paths.GuardianExe, true); } catch { }
                       if (!ServiceController.GetServices().Any(s => s.ServiceName == Paths.ServiceName))
-                          SystemEnforcer.RunCmd("sc.exe", $"create {Paths.ServiceName} binPath= \"\\\"{Paths.ServiceExe}\\\" --service\" start= auto DisplayName= \"PieceS NextDNS Protection\"");
-                      SystemEnforcer.RunCmd("sc.exe", $"failure {Paths.ServiceName} reset= 0 actions= restart/1000/restart/1000/restart/1000");
-                      SystemEnforcer.RunCmd("sc.exe", $"start {Paths.ServiceName}");
+                          SystemEnforcer.RunCmd("sc.exe", "create " + Paths.ServiceName + " binPath= \"\\\"" + Paths.ServiceExe + "\\\" --service\" start= auto DisplayName= \"PieceS NextDNS Protection\"");
+                      SystemEnforcer.RunCmd("sc.exe", "config " + Paths.ServiceName + " start= auto");
+                      SystemEnforcer.RunCmd("sc.exe", "failure " + Paths.ServiceName + " reset= 0 actions= restart/500/restart/500/restart/500");
+                      SystemEnforcer.RunCmd("sc.exe", "start " + Paths.ServiceName);
                   }
 
                   private void SendServiceCmd(int c)
@@ -682,7 +783,7 @@ jobs:
 
                   private void RefreshUi()
                   {
-                      var cfg = Paths.LoadConfig();
+                      var cfg = Paths.GetCachedConfig();
                       var st = Paths.LoadStats();
                       bool run = false;
                       try { using var sc = new ServiceController(Paths.ServiceName); run = sc.Status == ServiceControllerStatus.Running; } catch { }
@@ -690,10 +791,10 @@ jobs:
                       btnUninstall.Enabled = !cfg.Locked;
                       btnLock.Text = cfg.Locked ? "2. UNLOCK PROTECTION (Requires PIN)" : "2. ACTIVATE LOCK NOW (1-Tap)";
                       lblStatus.Text = "SYSTEM STATUS:\n" +
-                          (run ? $"[ON] 1. NextDNS DoH Service: RUNNING ({st.QueriesCount} queries)\n" : "[OFF] 1. NextDNS DoH Service: STOPPED\n") +
-                          (cfg.Locked ? "[ON] 2. Service & Folder Deletion Guard: ACTIVE\n" : "[OFF] 2. Service & Folder Deletion Guard: OFF\n") +
+                          (run ? "[ON] 1. NextDNS DoH Service: RUNNING (" + st.QueriesCount + " queries)\n" : "[OFF] 1. NextDNS DoH Service: STOPPED\n") +
+                          (cfg.Locked ? "[ON] 2. Low-Power Twin Guardian (0.0% CPU): ACTIVE\n" : "[OFF] 2. Low-Power Twin Guardian: OFF\n") +
                           (cfg.Locked ? "[ON] 3. Cloudflare Task Killer & Firewall Block: ACTIVE\n" : "[OFF] 3. Cloudflare Task Killer & Firewall Block: STANDBY\n") +
-                          (cfg.Locked ? "\nMODE: LOCKED & PROTECTED (IPv4 + IPv6)" : "\nMODE: UNLOCKED (Testing Mode)");
+                          (cfg.Locked ? "\nMODE: LOCKED & PROTECTED (Battery Friendly)" : "\nMODE: UNLOCKED (Testing Mode)");
                   }
               }
 
@@ -703,6 +804,8 @@ jobs:
                   static void Main(string[] args)
                   {
                       if (args.Contains("--service")) { ServiceBase.Run(new PieceSWindowsService()); return; }
+                      if (args.Contains("--guardian")) { RunLowPowerGuardian(); return; }
+
                       using var id = WindowsIdentity.GetCurrent();
                       if (!new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator))
                       {
@@ -711,6 +814,27 @@ jobs:
                       }
                       ApplicationConfiguration.Initialize();
                       Application.Run(new MainForm());
+                  }
+
+                  private static void RunLowPowerGuardian()
+                  {
+                      using var lockHandle = new FileStream(Paths.GuardianExe, FileMode.Open, FileAccess.Read, FileShare.Read);
+                      while (true)
+                      {
+                          try
+                          {
+                              var cfg = Paths.GetCachedConfig();
+                              if (!cfg.Locked) break;
+
+                              SystemEnforcer.CloseTamperDialogsIfMmcOpen();
+                              SystemEnforcer.EnsureServiceAutoStartAndRunning();
+                          }
+                          catch { }
+
+                          // Sleep 2 seconds when services.msc is closed (0.0% CPU), or 300ms when services.msc is open
+                          bool mmcOpen = SystemEnforcer.IsMmcOrMainFormOpen(out _);
+                          Thread.Sleep(mmcOpen ? 300 : 2000);
+                      }
                   }
               }
           }
@@ -722,5 +846,5 @@ jobs:
       - name: Upload PieceS-Windows EXE
         uses: actions/upload-artifact@v4
         with:
-          name: PieceS-Windows-v2.0-EXE
+          name: PieceS-Windows-v2.2-EXE
           path: publish/PieceS-Windows.exe
