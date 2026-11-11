@@ -1,0 +1,894 @@
+name: Build Piece S Windows 11 EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Generate Piece S Windows 11 Project
+        run: |
+          mkdir -p PieceSWin
+
+          cat << 'EOF' > PieceSWin/PieceSWin.csproj
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>WinExe</OutputType>
+              <TargetFramework>net8.0-windows</TargetFramework>
+              <EnableWindowsTargeting>true</EnableWindowsTargeting>
+              <UseWindowsForms>true</UseWindowsForms>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>enable</Nullable>
+              <PublishSingleFile>true</PublishSingleFile>
+              <SelfContained>true</SelfContained>
+              <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+              <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+              <AssemblyName>PieceS-Windows</AssemblyName>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat << 'EOF' > PieceSWin/Program.cs
+          using System;
+          using System.Collections.Concurrent;
+          using System.Collections.Generic;
+          using System.Diagnostics;
+          using System.Drawing;
+          using System.IO;
+          using System.Linq;
+          using System.Net;
+          using System.Net.Http;
+          using System.Net.Http.Headers;
+          using System.Net.NetworkInformation;
+          using System.Net.Sockets;
+          using System.Runtime.InteropServices;
+          using System.Security.AccessControl;
+          using System.Security.Principal;
+          using System.ServiceProcess;
+          using System.Text;
+          using System.Text.Json;
+          using System.Threading;
+          using System.Threading.Tasks;
+          using System.Windows.Forms;
+          using Microsoft.Win32;
+
+          namespace PieceSWin
+          {
+              public class AppConfig
+              {
+                  public string DnsId { get; set; } = "";
+                  public bool Locked { get; set; } = false;
+              }
+
+              public class RuntimeStats
+              {
+                  public long QueriesCount { get; set; } = 0;
+              }
+
+              public static class Paths
+              {
+                  public static readonly string BaseDir = @"C:\ProgramData\PieceS";
+                  public static readonly string ConfigFile = Path.Combine(BaseDir, "config.json");
+                  public static readonly string StatsFile = Path.Combine(BaseDir, "stats.json");
+                  public static readonly string ServiceExe = Path.Combine(BaseDir, "PieceSService.exe");
+                  public static readonly string ServiceName = "PieceSService";
+
+                  public static void EnsureDirectory()
+                  {
+                      if (!Directory.Exists(BaseDir))
+                          Directory.CreateDirectory(BaseDir);
+                  }
+
+                  public static AppConfig LoadConfig()
+                  {
+                      try
+                      {
+                          if (File.Exists(ConfigFile))
+                              return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigFile)) ?? new AppConfig();
+                      }
+                      catch { }
+                      return new AppConfig();
+                  }
+
+                  public static void SaveConfig(AppConfig cfg)
+                  {
+                      try
+                      {
+                          EnsureDirectory();
+                          UnlockDirectoryAcl();
+                          File.WriteAllText(ConfigFile, JsonSerializer.Serialize(cfg));
+                          if (cfg.Locked) LockDirectoryAcl();
+                      }
+                      catch { }
+                  }
+
+                  public static RuntimeStats LoadStats()
+                  {
+                      try
+                      {
+                          if (File.Exists(StatsFile))
+                              return JsonSerializer.Deserialize<RuntimeStats>(File.ReadAllText(StatsFile)) ?? new RuntimeStats();
+                      }
+                      catch { }
+                      return new RuntimeStats();
+                  }
+
+                  public static void SaveStats(long queries)
+                  {
+                      try
+                      {
+                          EnsureDirectory();
+                          File.WriteAllText(StatsFile, JsonSerializer.Serialize(new RuntimeStats { QueriesCount = queries }));
+                      }
+                      catch { }
+                  }
+
+                  public static void LockDirectoryAcl()
+                  {
+                      try
+                      {
+                          var dirInfo = new DirectoryInfo(BaseDir);
+                          var security = dirInfo.GetAccessControl();
+                          var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+                          var denyRule = new FileSystemAccessRule(
+                              everyone,
+                              FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles,
+                              InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                              PropagationFlags.None,
+                              AccessControlType.Deny);
+                          security.AddAccessRule(denyRule);
+                          dirInfo.SetAccessControl(security);
+                      }
+                      catch { }
+                  }
+
+                  public static void UnlockDirectoryAcl()
+                  {
+                      try
+                      {
+                          if (!Directory.Exists(BaseDir)) return;
+                          var dirInfo = new DirectoryInfo(BaseDir);
+                          var security = dirInfo.GetAccessControl();
+                          var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+                          var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier));
+                          foreach (FileSystemAccessRule rule in rules)
+                          {
+                              if (rule.AccessControlType == AccessControlType.Deny && rule.IdentityReference.Equals(everyone))
+                                  security.RemoveAccessRuleSpecific(rule);
+                          }
+                          dirInfo.SetAccessControl(security);
+                      }
+                      catch { }
+                  }
+              }
+
+              public static class DohEngine
+              {
+                  public static long QueriesResolved = 0;
+                  private static readonly HttpClient Http = CreateBootstrapClient();
+                  private static readonly ConcurrentDictionary<string, (byte[] Response, DateTime Expiry)> Cache = new();
+
+                  private static HttpClient CreateBootstrapClient()
+                  {
+                      var handler = new SocketsHttpHandler
+                      {
+                          ConnectCallback = async (context, token) =>
+                          {
+                              var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                              try
+                              {
+                                  await socket.ConnectAsync(new IPAddress(new byte[] { 45, 90, 28, 0 }), 443, token);
+                              }
+                              catch
+                              {
+                                  await socket.ConnectAsync(new IPAddress(new byte[] { 45, 90, 30, 0 }), 443, token);
+                              }
+                              return new NetworkStream(socket, ownsSocket: true);
+                          },
+                          PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                          PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+                          MaxConnectionsPerServer = 32
+                      };
+                      return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
+                  }
+
+                  public static async Task<bool> TestDohEndpointAsync(string dnsId)
+                  {
+                      try
+                      {
+                          byte[] sampleQuery = new byte[] {
+                              0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d,
+                              0x00, 0x00, 0x01, 0x00, 0x01
+                          };
+                          var res = await ResolveDohAsync(sampleQuery, dnsId);
+                          return res != null && res.Length > 12;
+                      }
+                      catch { return false; }
+                  }
+
+                  public static async Task<byte[]?> ResolveDohAsync(byte[] query, string dnsId)
+                  {
+                      if (query.Length < 12 || string.IsNullOrWhiteSpace(dnsId)) return null;
+
+                      string qName = ParseQueryName(query, out int qType);
+                      if (IsLocalhostDomain(qName))
+                          return BuildLocalhostResponse(query, qType);
+
+                      string cacheKey = $"{dnsId}:{qName}:{qType}";
+                      if (Cache.TryGetValue(cacheKey, out var cached) && cached.Expiry > DateTime.UtcNow)
+                      {
+                          byte[] clone = (byte[])cached.Response.Clone();
+                          clone[0] = query[0];
+                          clone[1] = query[1];
+                          Interlocked.Increment(ref QueriesResolved);
+                          return clone;
+                      }
+
+                      using var content = new ByteArrayContent(query);
+                      content.Headers.ContentType = new MediaTypeHeaderValue("application/dns-message");
+
+                      using var req = new HttpRequestMessage(HttpMethod.Post, $"https://dns.nextdns.io/{dnsId}") { Content = content };
+                      req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/dns-message"));
+
+                      using var resp = await Http.SendAsync(req);
+                      if (!resp.IsSuccessStatusCode) return null;
+
+                      byte[] bytes = await resp.Content.ReadAsByteArrayAsync();
+                      if (bytes.Length > 12)
+                      {
+                          if (Cache.Count > 2000) Cache.Clear();
+                          Cache[cacheKey] = ((byte[])bytes.Clone(), DateTime.UtcNow.AddSeconds(60));
+                          bytes[0] = query[0];
+                          bytes[1] = query[1];
+                          Interlocked.Increment(ref QueriesResolved);
+                          return bytes;
+                      }
+                      return null;
+                  }
+
+                  private static bool IsLocalhostDomain(string domain)
+                  {
+                      if (string.IsNullOrEmpty(domain)) return false;
+                      string d = domain.TrimEnd('.').ToLowerInvariant();
+                      return d == "localhost" || d.EndsWith(".localhost") || d.EndsWith(".local") || d.EndsWith(".test") || d.EndsWith(".internal");
+                  }
+
+                  private static byte[]? BuildLocalhostResponse(byte[] query, int qType)
+                  {
+                      if (qType != 1 && qType != 28) return null;
+                      int questionEnd = 12;
+                      while (questionEnd < query.Length && query[questionEnd] != 0)
+                          questionEnd += query[questionEnd] + 1;
+                      questionEnd += 5;
+                      if (questionEnd > query.Length) return null;
+
+                      byte[] rdata = qType == 1
+                          ? new byte[] { 127, 0, 0, 1 }
+                          : new byte[] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+                      var resp = new List<byte>(questionEnd + 16 + rdata.Length)
+                      {
+                          query[0], query[1], 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00
+                      };
+                      for (int i = 12; i < questionEnd; i++) resp.Add(query[i]);
+                      resp.AddRange(new byte[] { 0xC0, 0x0C, (byte)((qType >> 8) & 0xFF), (byte)(qType & 0xFF), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, (byte)rdata.Length });
+                      resp.AddRange(rdata);
+                      return resp.ToArray();
+                  }
+
+                  private static string ParseQueryName(byte[] query, out int qType)
+                  {
+                      qType = 1;
+                      try
+                      {
+                          var sb = new StringBuilder();
+                          int pos = 12;
+                          while (pos < query.Length && query[pos] > 0)
+                          {
+                              int len = query[pos++];
+                              if (pos + len > query.Length) break;
+                              if (sb.Length > 0) sb.Append('.');
+                              sb.Append(Encoding.ASCII.GetString(query, pos, len));
+                              pos += len;
+                          }
+                          if (pos + 2 < query.Length)
+                              qType = (query[pos + 1] << 8) | query[pos + 2];
+                          return sb.ToString();
+                      }
+                      catch { return ""; }
+                  }
+              }
+
+              public static class SystemEnforcer
+              {
+                  public static void EnforceDnsAndPolicies(bool locked)
+                  {
+                      try
+                      {
+                          LockPhysicalAdaptersToLoopback();
+                          ApplyBrowserPolicies(locked);
+                      }
+                      catch { }
+                  }
+
+                  public static void LockPhysicalAdaptersToLoopback()
+                  {
+                      foreach (var nic in GetPhysicalInternetAdapters())
+                      {
+                          var dns = nic.GetIPProperties().DnsAddresses;
+                          if (!(dns.Count == 1 && dns[0].Equals(IPAddress.Loopback)))
+                              RunCmd("netsh", $"interface ipv4 set dnsservers name=\"{nic.Name}\" static 127.0.0.1 primary validate=no");
+                      }
+                  }
+
+                  public static void RestoreDefaultDhcpDns()
+                  {
+                      foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                      {
+                          if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                          RunCmd("netsh", $"interface ipv4 set dnsservers name=\"{nic.Name}\" source=dhcp");
+                      }
+                      RunCmd("ipconfig", "/flushdns");
+                  }
+
+                  private static IEnumerable<NetworkInterface> GetPhysicalInternetAdapters()
+                  {
+                      foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                      {
+                          if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                          if (nic.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 &&
+                              nic.NetworkInterfaceType != NetworkInterfaceType.Ethernet) continue;
+
+                          string desc = (nic.Name + " " + nic.Description).ToLowerInvariant();
+                          if (desc.Contains("wsl") || desc.Contains("hyper-v") || desc.Contains("vethernet") ||
+                              desc.Contains("docker") || desc.Contains("vmware") || desc.Contains("virtualbox") ||
+                              desc.Contains("tap-") || desc.Contains("wintun") || desc.Contains("wireguard") || desc.Contains("loopback"))
+                              continue;
+
+                          if (nic.GetIPProperties().GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork))
+                              yield return nic;
+                      }
+                  }
+
+                  public static void ApplyBrowserPolicies(bool locked)
+                  {
+                      string[] chromium = {
+                          @"SOFTWARE\Policies\Google\Chrome",
+                          @"SOFTWARE\Policies\Microsoft\Edge",
+                          @"SOFTWARE\Policies\BraveSoftware\Brave"
+                      };
+                      foreach (var path in chromium)
+                      {
+                          try
+                          {
+                              if (locked)
+                              {
+                                  using var key = Registry.LocalMachine.CreateSubKey(path, true);
+                                  key?.SetValue("DnsOverHttpsMode", "off", RegistryValueKind.String);
+                              }
+                              else
+                              {
+                                  using var key = Registry.LocalMachine.OpenSubKey(path, true);
+                                  key?.DeleteValue("DnsOverHttpsMode", false);
+                              }
+                          }
+                          catch { }
+                      }
+
+                      try
+                      {
+                          string ffPath = @"SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS";
+                          if (locked)
+                          {
+                              using var key = Registry.LocalMachine.CreateSubKey(ffPath, true);
+                              key?.SetValue("Enabled", 0, RegistryValueKind.DWord);
+                              key?.SetValue("Locked", 1, RegistryValueKind.DWord);
+                          }
+                          else
+                          {
+                              Registry.LocalMachine.DeleteSubKeyTree(ffPath, false);
+                          }
+                      }
+                      catch { }
+                  }
+
+                  public static void RunCmd(string file, string args)
+                  {
+                      try
+                      {
+                          using var p = Process.Start(new ProcessStartInfo
+                          {
+                              FileName = file,
+                              Arguments = args,
+                              CreateNoWindow = true,
+                              UseShellExecute = false,
+                              WindowStyle = ProcessWindowStyle.Hidden
+                          });
+                          p?.WaitForExit(3000);
+                      }
+                      catch { }
+                  }
+              }
+
+              public class PieceSWindowsService : ServiceBase
+              {
+                  [StructLayout(LayoutKind.Sequential)]
+                  private struct SERVICE_STATUS
+                  {
+                      public int dwServiceType;
+                      public int dwCurrentState;
+                      public int dwControlsAccepted;
+                      public int dwWin32ExitCode;
+                      public int dwServiceSpecificExitCode;
+                      public int dwCheckPoint;
+                      public int dwWaitHint;
+                  }
+
+                  [DllImport("advapi32.dll", SetLastError = true)]
+                  private static extern bool SetServiceStatus(IntPtr hServiceStatus, ref SERVICE_STATUS lpServiceStatus);
+
+                  private CancellationTokenSource? _cts;
+                  private FileStream? _selfLockHandle;
+
+                  public PieceSWindowsService()
+                  {
+                      ServiceName = Paths.ServiceName;
+                      CanStop = true;
+                  }
+
+                  protected override void OnStart(string[] args)
+                  {
+                      _cts = new CancellationTokenSource();
+                      try
+                      {
+                          _selfLockHandle = new FileStream(Paths.ServiceExe, FileMode.Open, FileAccess.Read, FileShare.Read);
+                      }
+                      catch { }
+
+                      var cfg = Paths.LoadConfig();
+                      UpdateStopPermission(cfg.Locked);
+
+                      Task.Run(() => RunUdpDnsListenerAsync(_cts.Token));
+                      Task.Run(() => RunTcpDnsListenerAsync(_cts.Token));
+                      Task.Run(() => RunWatchdogLoopAsync(_cts.Token));
+                  }
+
+                  protected override void OnCustomCommand(int command)
+                  {
+                      if (command == 128)
+                      {
+                          UpdateStopPermission(true);
+                          Paths.LockDirectoryAcl();
+                          SystemEnforcer.EnforceDnsAndPolicies(true);
+                          SystemEnforcer.RunCmd("ipconfig", "/flushdns");
+                      }
+                      else if (command == 129)
+                      {
+                          UpdateStopPermission(false);
+                          Paths.UnlockDirectoryAcl();
+                          SystemEnforcer.ApplyBrowserPolicies(false);
+                      }
+                  }
+
+                  private void UpdateStopPermission(bool locked)
+                  {
+                      try
+                      {
+                          CanStop = !locked;
+                          SERVICE_STATUS status = new SERVICE_STATUS
+                          {
+                              dwServiceType = 0x10,
+                              dwCurrentState = 0x04,
+                              dwControlsAccepted = locked ? 0 : 0x01
+                          };
+                          SetServiceStatus(this.ServiceHandle, ref status);
+                      }
+                      catch { }
+                  }
+
+                  private async Task RunUdpDnsListenerAsync(CancellationToken token)
+                  {
+                      while (!token.IsCancellationRequested)
+                      {
+                          try
+                          {
+                              using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 53));
+                              while (!token.IsCancellationRequested)
+                              {
+                                  var result = await udp.ReceiveAsync(token);
+                                  _ = Task.Run(async () =>
+                                  {
+                                      try
+                                      {
+                                          var cfg = Paths.LoadConfig();
+                                          var resp = await DohEngine.ResolveDohAsync(result.Buffer, cfg.DnsId);
+                                          if (resp != null)
+                                              await udp.SendAsync(resp, resp.Length, result.RemoteEndPoint);
+                                      }
+                                      catch { }
+                                  }, token);
+                              }
+                          }
+                          catch { await Task.Delay(1000, token); }
+                      }
+                  }
+
+                  private async Task RunTcpDnsListenerAsync(CancellationToken token)
+                  {
+                      while (!token.IsCancellationRequested)
+                      {
+                          TcpListener? listener = null;
+                          try
+                          {
+                              listener = new TcpListener(IPAddress.Loopback, 53);
+                              listener.Start();
+                              while (!token.IsCancellationRequested)
+                              {
+                                  var client = await listener.AcceptTcpClientAsync(token);
+                                  _ = Task.Run(async () =>
+                                  {
+                                      using (client)
+                                      {
+                                          try
+                                          {
+                                              using var stream = client.GetStream();
+                                              byte[] lenBuf = new byte[2];
+                                              if (await stream.ReadAsync(lenBuf, 0, 2, token) < 2) return;
+                                              int qLen = (lenBuf[0] << 8) | lenBuf[1];
+                                              byte[] qBuf = new byte[qLen];
+                                              int read = 0;
+                                              while (read < qLen)
+                                              {
+                                                  int n = await stream.ReadAsync(qBuf, read, qLen - read, token);
+                                                  if (n <= 0) break;
+                                                  read += n;
+                                              }
+                                              var cfg = Paths.LoadConfig();
+                                              var resp = await DohEngine.ResolveDohAsync(qBuf, cfg.DnsId);
+                                              if (resp != null)
+                                              {
+                                                  byte[] outLen = { (byte)((resp.Length >> 8) & 0xFF), (byte)(resp.Length & 0xFF) };
+                                                  await stream.WriteAsync(outLen, 0, 2, token);
+                                                  await stream.WriteAsync(resp, 0, resp.Length, token);
+                                              }
+                                          }
+                                          catch { }
+                                      }
+                                  }, token);
+                              }
+                          }
+                          catch
+                          {
+                              try { listener?.Stop(); } catch { }
+                              await Task.Delay(1000, token);
+                          }
+                      }
+                  }
+
+                  private async Task RunWatchdogLoopAsync(CancellationToken token)
+                  {
+                      while (!token.IsCancellationRequested)
+                      {
+                          try
+                          {
+                              var cfg = Paths.LoadConfig();
+                              UpdateStopPermission(cfg.Locked);
+                              if (!string.IsNullOrWhiteSpace(cfg.DnsId))
+                              {
+                                  SystemEnforcer.LockPhysicalAdaptersToLoopback();
+                                  if (cfg.Locked)
+                                  {
+                                      SystemEnforcer.ApplyBrowserPolicies(true);
+                                      Paths.LockDirectoryAcl();
+                                  }
+                              }
+                              Paths.SaveStats(DohEngine.QueriesResolved);
+                          }
+                          catch { }
+                          await Task.Delay(2500, token);
+                      }
+                  }
+
+                  protected override void OnStop()
+                  {
+                      if (Paths.LoadConfig().Locked)
+                      {
+                          UpdateStopPermission(true);
+                          return;
+                      }
+                      _cts?.Cancel();
+                      try { _selfLockHandle?.Dispose(); } catch { }
+                      base.OnStop();
+                  }
+              }
+
+              public class MainForm : Form
+              {
+                  private TextBox dnsInput = null!;
+                  private Label lblTestResult = null!;
+                  private TextBox pinInput = null!;
+                  private Button btnLock = null!;
+                  private Button btnUninstall = null!;
+                  private Label lblStatus = null!;
+
+                  public MainForm()
+                  {
+                      Text = "Piece S v1.0: Windows 11 Edition";
+                      Size = new Size(500, 620);
+                      FormBorderStyle = FormBorderStyle.FixedSingle;
+                      MaximizeBox = false;
+                      StartPosition = FormStartPosition.CenterScreen;
+                      Font = new Font("Segoe UI", 10f);
+
+                      var cfg = Paths.LoadConfig();
+                      var layout = new FlowLayoutPanel
+                      {
+                          Dock = DockStyle.Fill,
+                          FlowDirection = FlowDirection.TopDown,
+                          WrapContents = false,
+                          Padding = new Padding(25, 20, 25, 20)
+                      };
+
+                      layout.Controls.Add(new Label
+                      {
+                          Text = "Piece S v1.0: Windows 11 Edition",
+                          Font = new Font("Segoe UI Semibold", 15f, FontStyle.Bold),
+                          AutoSize = true,
+                          Margin = new Padding(0, 0, 0, 15)
+                      });
+
+                      layout.Controls.Add(new Label { Text = "Enter NextDNS ID (e.g. a1b2c3):", AutoSize = true });
+                      dnsInput = new TextBox { Width = 425, Text = cfg.DnsId, Margin = new Padding(0, 5, 0, 12) };
+                      layout.Controls.Add(dnsInput);
+
+                      var btnStart = new Button { Text = "1. Start / Restart NextDNS DoH Service", Width = 425, Height = 40, Margin = new Padding(0, 0, 0, 10) };
+                      btnStart.Click += BtnStart_Click;
+                      layout.Controls.Add(btnStart);
+
+                      var btnVerify = new Button { Text = "Verify NextDNS Resolver (Live Test)", Width = 425, Height = 40, Margin = new Padding(0, 0, 0, 6) };
+                      btnVerify.Click += BtnVerify_Click;
+                      layout.Controls.Add(btnVerify);
+
+                      lblTestResult = new Label { Text = "Click Verify above to test resolver.", AutoSize = true, Margin = new Padding(0, 2, 0, 15) };
+                      layout.Controls.Add(lblTestResult);
+
+                      layout.Controls.Add(new Label { Text = "PIN to Unlock (Default: 1234):", AutoSize = true });
+                      pinInput = new TextBox { Width = 425, UseSystemPasswordChar = true, Margin = new Padding(0, 5, 0, 12) };
+                      layout.Controls.Add(pinInput);
+
+                      btnLock = new Button { Width = 425, Height = 44, Font = new Font("Segoe UI Semibold", 10.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, 12) };
+                      btnLock.Click += BtnLock_Click;
+                      layout.Controls.Add(btnLock);
+
+                      btnUninstall = new Button { Text = "Restore Default DHCP DNS & Stop Service (Unlocked Only)", Width = 425, Height = 36, Margin = new Padding(0, 0, 0, 15) };
+                      btnUninstall.Click += BtnUninstall_Click;
+                      layout.Controls.Add(btnUninstall);
+
+                      lblStatus = new Label { Width = 425, Height = 160, Font = new Font("Segoe UI", 9.5f) };
+                      layout.Controls.Add(lblStatus);
+
+                      Controls.Add(layout);
+
+                      var timer = new System.Windows.Forms.Timer { Interval = 1500 };
+                      timer.Tick += (s, e) => RefreshStatus();
+                      timer.Start();
+                      RefreshStatus();
+                  }
+
+                  private string CleanDnsId(string raw) =>
+                      raw.Trim().Replace("https://dns.nextdns.io/", "", StringComparison.OrdinalIgnoreCase).Replace("/", "");
+
+                  private void BtnStart_Click(object? sender, EventArgs e)
+                  {
+                      string id = CleanDnsId(dnsInput.Text);
+                      if (string.IsNullOrEmpty(id))
+                      {
+                          MessageBox.Show("Enter your NextDNS ID first!");
+                          return;
+                      }
+                      var cfg = Paths.LoadConfig();
+                      cfg.DnsId = id;
+                      Paths.SaveConfig(cfg);
+                      InstallAndStartService();
+                      SystemEnforcer.LockPhysicalAdaptersToLoopback();
+                      SystemEnforcer.RunCmd("ipconfig", "/flushdns");
+                      RefreshStatus();
+                  }
+
+                  private async void BtnVerify_Click(object? sender, EventArgs e)
+                  {
+                      string id = CleanDnsId(dnsInput.Text);
+                      if (string.IsNullOrEmpty(id))
+                      {
+                          lblTestResult.Text = "Enter NextDNS ID first";
+                          return;
+                      }
+                      lblTestResult.Text = "Testing DoH tunnel & NextDNS...";
+                      var sw = Stopwatch.StartNew();
+                      bool ok = await DohEngine.TestDohEndpointAsync(id);
+                      sw.Stop();
+                      lblTestResult.Text = ok
+                          ? $"\u2705 NextDNS DoH Verified & Filtering! ({sw.ElapsedMilliseconds}ms)"
+                          : "\u274C DoH Test Failed. Check internet or ID.";
+                      RefreshStatus();
+                  }
+
+                  private void BtnLock_Click(object? sender, EventArgs e)
+                  {
+                      var cfg = Paths.LoadConfig();
+                      if (!cfg.Locked)
+                      {
+                          string id = CleanDnsId(dnsInput.Text);
+                          if (string.IsNullOrEmpty(id))
+                          {
+                              MessageBox.Show("Enter your NextDNS ID before locking!");
+                              return;
+                          }
+                          cfg.DnsId = id;
+                          cfg.Locked = true;
+                          Paths.SaveConfig(cfg);
+                          InstallAndStartService();
+                          SystemEnforcer.EnforceDnsAndPolicies(true);
+                          NotifyServiceCommand(128);
+                          RefreshStatus();
+                          MessageBox.Show("\uD83D\uDD12 Protection LOCKED!");
+                      }
+                      else
+                      {
+                          if (pinInput.Text == "1234")
+                          {
+                              cfg.Locked = false;
+                              Paths.SaveConfig(cfg);
+                              pinInput.Text = "";
+                              NotifyServiceCommand(129);
+                              SystemEnforcer.ApplyBrowserPolicies(false);
+                              Paths.UnlockDirectoryAcl();
+                              RefreshStatus();
+                              MessageBox.Show("\uD83D\uDD13 Unlocked!");
+                          }
+                          else
+                          {
+                              MessageBox.Show("\u274C Enter PIN 1234 to Unlock!");
+                          }
+                      }
+                  }
+
+                  private void BtnUninstall_Click(object? sender, EventArgs e)
+                  {
+                      if (Paths.LoadConfig().Locked) return;
+                      Paths.UnlockDirectoryAcl();
+                      SystemEnforcer.ApplyBrowserPolicies(false);
+                      SystemEnforcer.RestoreDefaultDhcpDns();
+                      SystemEnforcer.RunCmd("sc.exe", $"stop {Paths.ServiceName}");
+                      SystemEnforcer.RunCmd("sc.exe", $"delete {Paths.ServiceName}");
+                      RefreshStatus();
+                      MessageBox.Show("Restored default Windows DHCP DNS and stopped service.");
+                  }
+
+                  private void InstallAndStartService()
+                  {
+                      try
+                      {
+                          Paths.EnsureDirectory();
+                          Paths.UnlockDirectoryAcl();
+                          string currentExe = Environment.ProcessPath ?? Application.ExecutablePath;
+                          if (!string.Equals(currentExe, Paths.ServiceExe, StringComparison.OrdinalIgnoreCase))
+                          {
+                              try { File.Copy(currentExe, Paths.ServiceExe, true); } catch { }
+                          }
+                          bool exists = ServiceController.GetServices().Any(s => s.ServiceName == Paths.ServiceName);
+                          if (!exists)
+                          {
+                              SystemEnforcer.RunCmd("sc.exe", $"create {Paths.ServiceName} binPath= \"\\\"{Paths.ServiceExe}\\\" --service\" start= auto DisplayName= \"PieceS NextDNS Protection\"");
+                          }
+                          SystemEnforcer.RunCmd("sc.exe", $"failure {Paths.ServiceName} reset= 0 actions= restart/1000/restart/1000/restart/1000");
+                          SystemEnforcer.RunCmd("sc.exe", $"start {Paths.ServiceName}");
+                      }
+                      catch { }
+                  }
+
+                  private void NotifyServiceCommand(int cmd)
+                  {
+                      try
+                      {
+                          using var sc = new ServiceController(Paths.ServiceName);
+                          if (sc.Status == ServiceControllerStatus.Running)
+                              sc.ExecuteCommand(cmd);
+                      }
+                      catch { }
+                  }
+
+                  private void RefreshStatus()
+                  {
+                      var cfg = Paths.LoadConfig();
+                      var stats = Paths.LoadStats();
+                      bool running = false;
+                      try
+                      {
+                          using var sc = new ServiceController(Paths.ServiceName);
+                          running = sc.Status == ServiceControllerStatus.Running;
+                      }
+                      catch { }
+
+                      dnsInput.Enabled = !cfg.Locked;
+                      btnUninstall.Enabled = !cfg.Locked;
+                      btnLock.Text = cfg.Locked ? "2. UNLOCK PROTECTION (Requires PIN)" : "2. ACTIVATE LOCK NOW (1-Tap)";
+
+                      var sb = new StringBuilder();
+                      sb.AppendLine("SYSTEM STATUS:");
+                      sb.AppendLine(running
+                          ? $"\u2705 1. NextDNS DoH Service: RUNNING ({stats.QueriesCount} queries)"
+                          : "\u274C 1. NextDNS DoH Service: STOPPED");
+                      sb.AppendLine(cfg.Locked
+                          ? "\u2705 2. Service & Folder Deletion Guard: ACTIVE"
+                          : "\u274C 2. Service & Folder Deletion Guard: OFF");
+                      sb.AppendLine(cfg.Locked
+                          ? "\u2705 3. Browser Secure DNS Policy Lock: ACTIVE"
+                          : "\u274C 3. Browser Secure DNS Policy Lock: OFF");
+                      sb.AppendLine(cfg.Locked
+                          ? "\n\uD83D\uDD12 MODE: LOCKED & PROTECTED"
+                          : "\n\uD83D\uDD13 MODE: UNLOCKED (Testing Mode)");
+                      lblStatus.Text = sb.ToString();
+                  }
+              }
+
+              internal static class Program
+              {
+                  [STAThread]
+                  static void Main(string[] args)
+                  {
+                      if (args.Contains("--service"))
+                      {
+                          ServiceBase.Run(new PieceSWindowsService());
+                          return;
+                      }
+
+                      if (!IsAdministrator())
+                      {
+                          try
+                          {
+                              Process.Start(new ProcessStartInfo
+                              {
+                                  FileName = Environment.ProcessPath ?? Application.ExecutablePath,
+                                  UseShellExecute = true,
+                                  Verb = "runas"
+                              });
+                          }
+                          catch { }
+                          return;
+                      }
+
+                      ApplicationConfiguration.Initialize();
+                      Application.Run(new MainForm());
+                  }
+
+                  private static bool IsAdministrator()
+                  {
+                      using var identity = WindowsIdentity.GetCurrent();
+                      var principal = new WindowsPrincipal(identity);
+                      return principal.IsInRole(WindowsBuiltInRole.Administrator);
+                  }
+              }
+          }
+          EOF
+
+      - name: Compile Standalone PieceS-Windows.exe
+        run: dotnet publish PieceSWin/PieceSWin.csproj -c Release -o publish
+
+      - name: Upload PieceS-Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: PieceS-Windows-EXE
+          path: publish/PieceS-Windows.exe
